@@ -747,6 +747,12 @@ public sealed class AiPreviewWindow : Window
 
 public sealed class ModelManagerWindow : Window
 {
+    private sealed record SpeechModelCard(string Id, string Name, string Source, string Notes);
+    private static readonly SpeechModelCard[] SpeechModels =
+    [
+        new("base", "Whisper Base", "Systran/faster-whisper-base", "低負荷・初回導入向け"),
+        new("small", "Whisper Small", "Systran/faster-whisper-small", "標準精度・通常はこちら")
+    ];
     private sealed record GemmaCard(string Id, string Name, string Source, double DiskGb, int RamGb, int VramGb);
     private static readonly GemmaCard[] GemmaModels =
     [
@@ -757,6 +763,13 @@ public sealed class ModelManagerWindow : Window
     ];
     private readonly string _runtime;
     private readonly PersistentPythonWorker _engine;
+    private readonly ComboBox _speechModel = new() { Width = 220, Margin = new Thickness(8, 0, 0, 0) };
+    private readonly TextBlock _speechDescription = new() { TextWrapping = TextWrapping.Wrap };
+    private readonly TextBlock _speechState = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
+    private readonly ProgressBar _speechProgress = new() { Minimum = 0, Maximum = 100, Height = 18, Visibility = Visibility.Collapsed };
+    private readonly Button _speechDownload = new() { Content = "音声モデルをダウンロード", Padding = new Thickness(12, 6, 12, 6) };
+    private readonly Button _speechValidate = new() { Content = "確認 / 更新", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(8, 0, 0, 0) };
+    private readonly Button _speechDelete = new() { Content = "削除", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(8, 0, 0, 0), IsEnabled = false };
     private readonly TextBlock _state = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
     private readonly ProgressBar _progress = new() { Minimum = 0, Maximum = 100, Height = 18, Visibility = Visibility.Collapsed };
     private readonly Button _download = new() { Content = "Download model", Padding = new Thickness(12, 6, 12, 6) };
@@ -775,7 +788,20 @@ public sealed class ModelManagerWindow : Window
         var panel = new StackPanel { Margin = new Thickness(16) };
         Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
         panel.Children.Add(new TextBlock { Text = "音声認識", FontSize = 18 });
-        panel.Children.Add(new TextBlock { Text = "OpenAI Whisper をベースにした音声認識\nBackend: faster-whisper\n状態: 利用可能（通常は「自動」を推奨）", TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(new TextBlock { Text = "OpenAI Whisper をベースにした音声認識\nBackend: faster-whisper\nモデル本体は、ここで明示的にダウンロードした場合だけ取得します。", TextWrapping = TextWrapping.Wrap });
+        var speechRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
+        speechRow.Children.Add(new TextBlock { Text = "音声モデル:", VerticalAlignment = VerticalAlignment.Center });
+        foreach (var model in SpeechModels) _speechModel.Items.Add(new ComboBoxItem { Content = model.Name, Tag = model.Id });
+        _speechModel.SelectedIndex = 1;
+        _speechModel.SelectionChanged += async (_, _) => { UpdateSpeechDescription(); await RefreshSpeechAsync(); };
+        speechRow.Children.Add(_speechModel); panel.Children.Add(speechRow);
+        UpdateSpeechDescription();
+        panel.Children.Add(_speechDescription); panel.Children.Add(_speechState); panel.Children.Add(_speechProgress);
+        var speechActions = new StackPanel { Orientation = Orientation.Horizontal };
+        _speechDownload.Click += async (_, _) => await DownloadSpeechAsync();
+        _speechValidate.Click += async (_, _) => await RefreshSpeechAsync();
+        _speechDelete.Click += async (_, _) => await DeleteSpeechAsync();
+        speechActions.Children.Add(_speechDownload); speechActions.Children.Add(_speechValidate); speechActions.Children.Add(_speechDelete); panel.Children.Add(speechActions);
         panel.Children.Add(new Separator { Margin = new Thickness(0, 12, 0, 8) });
         panel.Children.Add(new TextBlock { Text = "ローカル生成AI（Gemma 4）", FontSize = 18 });
         var modelRow = new StackPanel { Orientation = Orientation.Horizontal }; modelRow.Children.Add(new TextBlock { Text = "モデル:", VerticalAlignment = VerticalAlignment.Center });
@@ -820,6 +846,7 @@ public sealed class ModelManagerWindow : Window
     }
     public async Task RefreshAsync()
     {
+        await RefreshSpeechAsync();
         try
         {
             var response = await RunModelCommandAsync("model.status", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}");
@@ -906,8 +933,148 @@ public sealed class ModelManagerWindow : Window
         _appServer.ConfigureExecutablePath(dialog.FileName);
         await RefreshCodexAsync();
     }
+    private SpeechModelCard SelectedSpeech => SpeechModels.First(item => item.Id == (string)((ComboBoxItem)_speechModel.SelectedItem).Tag);
     private GemmaCard SelectedGemma => GemmaModels.First(item => item.Id == (string)((ComboBoxItem)_gemmaModel.SelectedItem).Tag);
+    private void UpdateSpeechDescription()
+    {
+        var item = SelectedSpeech;
+        _speechDescription.Text = $"提供元: {item.Source}\n用途: {item.Notes}\n保存先: runtime\\models\\{item.Id}";
+    }
     private void UpdateGemmaDescription() { var item = SelectedGemma; _gemmaDescription.Text = $"提供元: Google / Instruction Tuned\nモデルID: {item.Source}\n概算サイズ: {item.DiskGb:0.#} GB\n推奨RAM: {item.RamGb} GB / 推奨VRAM: {item.VramGb} GB\n利用条件: https://huggingface.co/{item.Source}"; }
+    private async Task RefreshSpeechAsync()
+    {
+        if (!HasSpeechModelRuntime())
+        {
+            _speechState.Text = "状態: Python音声モデル管理を確認できませんでした。\nインストール済みRuntimeを確認してください。";
+            _speechDownload.IsEnabled = _speechValidate.IsEnabled = _speechDelete.IsEnabled = false;
+            return;
+        }
+        try
+        {
+            var result = await RunSpeechModelCommandAsync("validate", SelectedSpeech.Id);
+            var valid = result.TryGetProperty("valid", out var validElement) && validElement.GetBoolean();
+            var state = result.TryGetProperty("state", out var stateElement) ? stateElement.GetString() : "unknown";
+            var path = result.TryGetProperty("path", out var pathElement) ? pathElement.GetString() : Path.Combine(_runtime, "models", SelectedSpeech.Id);
+            var missing = result.TryGetProperty("missing", out var missingElement) && missingElement.ValueKind == JsonValueKind.Array
+                ? string.Join(", ", missingElement.EnumerateArray().Select(item => item.GetString()))
+                : string.Empty;
+            _speechState.Text = valid
+                ? $"状態: インストール済み\n保存先: {path}"
+                : $"状態: {state}\n不足: {(string.IsNullOrWhiteSpace(missing) ? "未導入または不完全" : missing)}\n保存先: {path}";
+            _speechDownload.IsEnabled = !valid;
+            _speechDelete.IsEnabled = valid;
+            _speechValidate.IsEnabled = true;
+        }
+        catch (Exception error)
+        {
+            _speechState.Text = "状態: 確認失敗\n詳細: " + error.Message;
+            _speechDownload.IsEnabled = true;
+            _speechDelete.IsEnabled = false;
+            _speechValidate.IsEnabled = true;
+        }
+    }
+    private async Task DownloadSpeechAsync()
+    {
+        var item = SelectedSpeech;
+        var confirmation = MessageBox.Show(this, $"{item.Name} をHugging Faceからダウンロードします。\n\nSource: {item.Source}\n保存先: runtime\\models\\{item.Id}\n\n音声認識時に必要なモデルです。ダウンロードを開始しますか？", Title, MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        if (confirmation != MessageBoxResult.OK) return;
+        _speechDownload.IsEnabled = _speechValidate.IsEnabled = _speechDelete.IsEnabled = false;
+        _speechProgress.Visibility = Visibility.Visible; _speechProgress.IsIndeterminate = true;
+        _speechState.Text = "状態: ダウンロード中...";
+        try
+        {
+            await RunSpeechModelCommandAsync("download", item.Id, message =>
+            {
+                _speechState.Text = message;
+                if (message.Contains("完了", StringComparison.Ordinal)) { _speechProgress.IsIndeterminate = false; _speechProgress.Value = 100; }
+            });
+            await RefreshSpeechAsync();
+        }
+        catch (Exception error) { _speechState.Text = "状態: ダウンロード失敗\n詳細: " + error.Message; }
+        finally
+        {
+            _speechProgress.IsIndeterminate = false; _speechProgress.Visibility = Visibility.Collapsed;
+            _speechValidate.IsEnabled = true; _speechDownload.IsEnabled = true;
+        }
+    }
+    private async Task DeleteSpeechAsync()
+    {
+        var item = SelectedSpeech;
+        var confirmation = MessageBox.Show(this, $"{item.Name} を削除します。\n\n保存先: runtime\\models\\{item.Id}\n\nFAT本体や他のモデルは削除しません。", Title, MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        if (confirmation != MessageBoxResult.OK) return;
+        _speechDownload.IsEnabled = _speechValidate.IsEnabled = _speechDelete.IsEnabled = false;
+        try { await RunSpeechModelCommandAsync("delete", item.Id); }
+        catch (Exception error) { MessageBox.Show(this, "音声モデルを削除できませんでした。\n" + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Error); }
+        await RefreshSpeechAsync();
+    }
+    private bool HasSpeechModelRuntime() =>
+        File.Exists(ResolveRuntimePython()) &&
+        File.Exists(Path.Combine(_runtime, "python", "model_manager.py")) &&
+        File.Exists(Path.Combine(_runtime, "python", "att_engine", "model_service.py"));
+    private string ResolveRuntimePython()
+    {
+        var portable = Path.Combine(_runtime, "python-runtime", "python.exe");
+        return File.Exists(portable) ? portable : Path.Combine(_runtime, "python-env", "Scripts", "python.exe");
+    }
+    private async Task<JsonElement> RunSpeechModelCommandAsync(string command, string model, Action<string>? progress = null)
+    {
+        var python = ResolveRuntimePython();
+        var manager = Path.Combine(_runtime, "python", "model_manager.py");
+        if (!File.Exists(python) || !File.Exists(manager)) throw new FatException("FAT_RUNTIME_MISSING", "Python音声モデル管理Runtimeが見つかりません。");
+        Directory.CreateDirectory(Path.Combine(_runtime, "models"));
+        var start = new ProcessStartInfo(python)
+        {
+            WorkingDirectory = _runtime,
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = new UTF8Encoding(false),
+            StandardErrorEncoding = new UTF8Encoding(false),
+            CreateNoWindow = true
+        };
+        start.Environment["PYTHONUTF8"] = "1";
+        start.Environment["PYTHONIOENCODING"] = "utf-8";
+        start.ArgumentList.Add(manager);
+        start.ArgumentList.Add(command);
+        start.ArgumentList.Add("--model");
+        start.ArgumentList.Add(model);
+        start.ArgumentList.Add("--model-dir");
+        start.ArgumentList.Add(Path.Combine(_runtime, "models"));
+        using var process = Process.Start(start) ?? throw new FatException("FAT_PYTHON_START_FAILED", "音声モデル管理を開始できませんでした。");
+        var stderrTask = process.StandardError.ReadToEndAsync();
+        JsonDocument? last = null;
+        while (await process.StandardOutput.ReadLineAsync() is { } line)
+        {
+            if (string.IsNullOrWhiteSpace(line)) continue;
+            try
+            {
+                last?.Dispose();
+                last = JsonDocument.Parse(line);
+                var root = last.RootElement;
+                if (root.TryGetProperty("type", out var type) && type.GetString() == "error")
+                {
+                    var code = root.TryGetProperty("code", out var codeElement) ? codeElement.GetString() : "FAT_MODEL_ERROR";
+                    var message = root.TryGetProperty("message", out var messageElement) ? messageElement.GetString() : "モデル操作に失敗しました。";
+                    throw new FatException(code ?? "FAT_MODEL_ERROR", message ?? "モデル操作に失敗しました。");
+                }
+                if (root.TryGetProperty("message", out var messageProperty))
+                    progress?.Invoke(messageProperty.GetString() ?? line);
+            }
+            catch (JsonException) { progress?.Invoke(line); }
+        }
+        await process.WaitForExitAsync();
+        var stderr = await stderrTask;
+        if (process.ExitCode != 0) throw new FatException("FAT_MODEL_COMMAND_FAILED", string.IsNullOrWhiteSpace(stderr) ? "モデル操作に失敗しました。" : stderr.Trim());
+        if (last is null) throw new FatException("FAT_MODEL_COMMAND_FAILED", "モデル操作の結果を取得できませんでした。");
+        var finalRoot = last.RootElement.Clone();
+        last.Dispose();
+        if (finalRoot.TryGetProperty("type", out var finalType) && finalType.GetString() == "model_validation")
+        {
+            using var doc = JsonDocument.Parse(finalRoot.GetRawText());
+            return doc.RootElement.Clone();
+        }
+        return finalRoot;
+    }
     private async Task ValidateAsync() { _state.Text = "状態: 確認中..."; _state.Text = "確認結果: " + await RunModelCommandAsync("model.validate", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}"); await RefreshAsync(); }
     private async Task LoadAsync() { _state.Text = "状態: モデルを読み込み中..."; _state.Text = "読み込み結果: " + await RunModelCommandAsync("model.load", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}"); await RefreshAsync(); }
     private Task<string> RunModelCommandAsync(string type, string payload, Action<string>? progress = null) => _engine.RequestAsync(_runtime, type, payload, progress);
