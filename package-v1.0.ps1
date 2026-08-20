@@ -1,27 +1,35 @@
 param(
     [switch]$BuildPortablePython,
-    [switch]$BuildInstaller
+    [switch]$BuildInstaller,
+    [switch]$Clean,
+    [ValidatePattern('^\d+\.\d+\.\d+$')]
+    [string]$Version = '1.0.2'
 )
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $dotnet = Join-Path $env:ProgramFiles 'dotnet\dotnet.exe'
 $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
-$version = '1.0.0'
+$version = $Version
 $dist = Join-Path $root "dist\AviUtl2FAT-$version-x64"
 $payload = Join-Path $dist 'Plugin\AviUtl2FAT'
 $app = Join-Path $payload 'FAT'
 
 if (-not (Test-Path -LiteralPath $dotnet)) { throw ".NET SDK was not found: $dotnet" }
 if (-not (Test-Path -LiteralPath $cargo)) { throw "Rust cargo.exe was not found: $cargo" }
-if (Test-Path -LiteralPath $dist) { Remove-Item -LiteralPath $dist -Recurse -Force }
+if (Test-Path -LiteralPath $dist) {
+    if (-not $Clean) {
+        throw "The package output already exists and was not changed: $dist`nChoose a new -Version (recommended), or explicitly pass -Clean to rebuild that exact version."
+    }
+    Remove-Item -LiteralPath $dist -Recurse -Force
+}
 New-Item -ItemType Directory -Force -Path $app | Out-Null
 
 # The App includes its isolated Worker. self-contained avoids a .NET Desktop
 # Runtime prerequisite on the recipient's computer.
-& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.App\AviUtl2FAT.App.csproj') -c Release -r win-x64 --self-contained true --no-restore -p:BuildProjectReferences=false -p:SkipFatWorkerDeployment=true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o $app
+& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.App\AviUtl2FAT.App.csproj') -c Release -r win-x64 --self-contained true -p:Version=$version -p:BuildProjectReferences=false -p:SkipFatWorkerDeployment=true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o $app
 if ($LASTEXITCODE -ne 0) { throw 'Self-contained App publish failed.' }
-& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.Worker\AviUtl2FAT.Worker.csproj') -c Release -r win-x64 --self-contained true --no-restore -p:DebugType=None -p:DebugSymbols=false -o $app
+& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.Worker\AviUtl2FAT.Worker.csproj') -c Release -r win-x64 --self-contained true -p:DebugType=None -p:DebugSymbols=false -o $app
 if ($LASTEXITCODE -ne 0) { throw 'Self-contained Worker publish failed.' }
 & $cargo build --manifest-path (Join-Path $root 'plugin\Cargo.toml') --release
 if ($LASTEXITCODE -ne 0) { throw 'Rust plugin release build failed.' }
@@ -51,7 +59,7 @@ Compress-Archive -Path (Join-Path $dist '*') -DestinationPath (Join-Path $root "
 if ($BuildInstaller) {
     $iscc = @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe', (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if (-not $iscc) { throw 'Inno Setup 6 is required to build the installer. Install it, then run this command again.' }
-    & $iscc (Join-Path $root 'release\AviUtl2FAT.iss') "/DSourcePayload=$payload"
+    & $iscc (Join-Path $root 'release\AviUtl2FAT.iss') "/DSourcePayload=$payload" "/DAppVersion=$version"
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup build failed.' }
 }
 [pscustomobject]@{ Product = 'AviUtl2 FAT'; Version = $version; Payload = $payload; SelfContainedDotNet = $true; PortablePython = [bool]$BuildPortablePython; ModelsBundled = $false } | ConvertTo-Json

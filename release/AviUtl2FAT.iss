@@ -1,5 +1,7 @@
 #define AppName "AviUtl2 FAT"
-#define AppVersion "1.0.0"
+#ifndef AppVersion
+  #define AppVersion "1.0.2"
+#endif
 #define AppPublisher "AviUtl2 FAT Project"
 #ifndef SourcePayload
   #define SourcePayload "..\\dist\\AviUtl2FAT-1.0.0-x64\\Plugin\\AviUtl2FAT"
@@ -13,7 +15,7 @@ AppPublisher={#AppPublisher}
 DefaultDirName={code:GetFatPluginDirectory}
 DisableProgramGroupPage=yes
 OutputDir=..\dist
-OutputBaseFilename=AviUtl2FAT-Setup-1.0.0-x64
+OutputBaseFilename=AviUtl2FAT-Setup-{#AppVersion}-x64
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
@@ -21,6 +23,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=dialog
 UninstallDisplayName={#AppName}
+UninstallDisplayIcon={code:GetFatPluginDirectory}\FAT\AviUtl2FAT.App.exe
 LicenseFile=..\LICENSE
 InfoBeforeFile=..\QUICKSTART.md
 
@@ -29,6 +32,7 @@ Source: "{#SourcePayload}\*"; DestDir: "{code:GetFatPluginDirectory}"; Flags: re
 
 [Icons]
 Name: "{autoprograms}\AviUtl2 FAT"; Filename: "{code:GetFatPluginDirectory}\FAT\AviUtl2FAT.App.exe"
+Name: "{autoprograms}\AviUtl2 FAT をアンインストール"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\AviUtl2 FAT"; Filename: "{code:GetFatPluginDirectory}\FAT\AviUtl2FAT.App.exe"; Tasks: desktopicon
 
 [Tasks]

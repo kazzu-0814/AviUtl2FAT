@@ -3,6 +3,7 @@
     <OutputType>WinExe</OutputType>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <Version>1.0.2</Version>
   </PropertyGroup>
 
   <ItemGroup>

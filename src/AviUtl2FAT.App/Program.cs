@@ -3,6 +3,8 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.IO.Pipes;
+using System.Net.Http;
+using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Text;
 using System.Text.Json;
@@ -32,6 +34,10 @@ public sealed class CaptionRow(FATCaption caption) : INotifyPropertyChanged
 
 public sealed class FatWindow : Window
 {
+    private static readonly string CurrentVersion = GetCurrentVersion();
+    private const string ReleasesApiUrl = "https://api.github.com/repos/kazzu-0814/AviUtl2FAT/releases?per_page=20";
+    private const string ReleasesPageUrl = "https://github.com/kazzu-0814/AviUtl2FAT/releases";
+    private static readonly HttpClient UpdateClient = CreateUpdateClient();
     private readonly TextBlock _media = new() { Text = "Media: not selected" };
     private readonly TextBlock _status = new() { Text = "Ready" };
     private readonly ProgressBar _progress = new() { Minimum = 0, Maximum = 100, Height = 18 };
@@ -64,10 +70,13 @@ public sealed class FatWindow : Window
     private string? _input;
     private bool _isRecognizing;
     private CancellationTokenSource? _recognitionCancellation;
+    private readonly Dictionary<string, Button> _navigationButtons = new(StringComparer.Ordinal);
+    private Expander? _advancedSettings;
+    private Border? _homeCard;
 
     public FatWindow()
     {
-        Title = "AviUtl2 FAT v1.0 - Formation Auto Text"; Width = 1200; Height = 780; MinWidth = 980; MinHeight = 620;
+        Title = $"AviUtl2 FAT v{CurrentVersion} - Formation Auto Text"; Width = 1200; Height = 780; MinWidth = 980; MinHeight = 620;
         var root = new Grid { Background = System.Windows.Media.Brushes.White };
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -78,14 +87,15 @@ public sealed class FatWindow : Window
         var navigation = new StackPanel { Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(31, 41, 55)), Margin = new Thickness(0) };
         navigation.Children.Add(new TextBlock { Text = "AviUtl2\nFAT", Foreground = System.Windows.Media.Brushes.White, FontSize = 22, FontWeight = FontWeights.Bold, Margin = new Thickness(20, 24, 8, 28) });
         foreach (var item in new[] { "ホーム", "字幕", "AI", "スタイル", "出力", "設定" })
-            navigation.Children.Add(new Button { Content = item, HorizontalContentAlignment = HorizontalAlignment.Left, Foreground = System.Windows.Media.Brushes.White, Background = System.Windows.Media.Brushes.Transparent, BorderThickness = new Thickness(0), Padding = new Thickness(20, 11, 8, 11) });
+            navigation.Children.Add(CreateNavigationButton(item));
         Grid.SetColumn(navigation, 0); root.Children.Add(navigation);
 
         var center = new DockPanel { Margin = new Thickness(28, 24, 20, 14) }; Grid.SetColumn(center, 1); root.Children.Add(center);
         var heading = new StackPanel { Margin = new Thickness(0, 0, 0, 14) }; DockPanel.SetDock(heading, Dock.Top); center.Children.Add(heading);
         heading.Children.Add(new TextBlock { Text = "動画から字幕を作成", FontSize = 27, FontWeight = FontWeights.SemiBold });
         heading.Children.Add(new TextBlock { Text = "1. 動画を選ぶ 　→　2. 字幕を作る 　→　3. 必要ならAIで整える 　→　4. 自分で直す 　→　5. AviUtl2へ出力", Foreground = System.Windows.Media.Brushes.DimGray, Margin = new Thickness(0, 6, 0, 12) });
-        var homeCard = new Border { BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 232, 240)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(18), Margin = new Thickness(0, 0, 0, 12) };
+        var homeCard = new Border { BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 232, 240)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(18), Margin = new Thickness(0, 0, 0, 12), Focusable = true };
+        _homeCard = homeCard;
         var home = new StackPanel(); homeCard.Child = home; heading.Children.Add(homeCard);
         home.Children.Add(new TextBlock { Text = "まず動画を選んで、字幕を作成します", FontWeight = FontWeights.SemiBold, FontSize = 16 });
         home.Children.Add(_media);
@@ -99,7 +109,7 @@ public sealed class FatWindow : Window
         details.Children.Add(new TextBlock { Text = "認識言語:", VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_recognitionLanguage);
         details.Children.Add(new TextBlock { Text = "字幕言語:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_outputLanguage);
         details.Children.Add(new TextBlock { Text = "音声認識:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_recognitionProfile);
-        advanced.Content = details; home.Children.Add(advanced);
+        advanced.Content = details; home.Children.Add(advanced); _advancedSettings = advanced;
 
         var progressBox = new StackPanel { Margin = new Thickness(0, 0, 0, 12) }; DockPanel.SetDock(progressBox, Dock.Top); center.Children.Add(progressBox);
         progressBox.Children.Add(new TextBlock { Text = "処理状況", FontWeight = FontWeights.SemiBold }); progressBox.Children.Add(_status); progressBox.Children.Add(_progress);
@@ -136,7 +146,7 @@ public sealed class FatWindow : Window
         AddButton(inspector, "AviUtl2へ出力", async (_, _) => await ExportAsync()).FontWeight = FontWeights.SemiBold;
         AddButton(inspector, "テキスト統一", (_, _) => ApplyStandardStyle());
         AddButton(inspector, "AviUtl2からスタイルを読み込む", async (_, _) => await RegisterObjectTemplateAsync());
-        AddButton(inspector, "AIモデル管理", async (_, _) => await ShowModelManagerAsync());
+        AddButton(inspector, "AIモデルを管理 / ダウンロード", async (_, _) => await ShowModelManagerAsync());
 
         var statusBar = new TextBlock { Text = "Python Engine: 待機中　|　Whisper: 自動設定　|　AI: AIなし　|　AviUtl2: 別プロセスで安全に動作", Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(241, 245, 249)), Padding = new Thickness(18, 8, 18, 8), Foreground = System.Windows.Media.Brushes.DimGray };
         Grid.SetRow(statusBar, 1); Grid.SetColumnSpan(statusBar, 3); root.Children.Add(statusBar);
@@ -149,7 +159,189 @@ public sealed class FatWindow : Window
         _aiProvider.SelectionChanged += async (_, _) => { UpdateAiState(); await SaveAiSettingsAsync(); };
         _codexBackend.SelectionChanged += async (_, _) => await SaveAiSettingsAsync();
         UpdateAiState();
+        SelectNavigation("ホーム");
         Closed += (_, _) => { _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
+    }
+
+    private Button CreateNavigationButton(string destination)
+    {
+        var button = new Button
+        {
+            Content = destination,
+            HorizontalContentAlignment = HorizontalAlignment.Left,
+            Foreground = System.Windows.Media.Brushes.White,
+            Background = System.Windows.Media.Brushes.Transparent,
+            BorderThickness = new Thickness(0),
+            Padding = new Thickness(20, 11, 8, 11),
+            ToolTip = destination switch
+            {
+                "ホーム" => "動画の選択と字幕作成へ移動します",
+                "字幕" => "字幕一覧を編集できる状態にします",
+                "AI" => "AIモデル管理を開きます。モデルの取得はここから明示的に行います",
+                "スタイル" => "字幕の標準スタイルまたはAviUtl2テンプレートを選びます",
+                "出力" => "AviUtl2用.object、SRT、TXTなどを出力します",
+                _ => "認識設定とアプリ更新を確認します"
+            }
+        };
+        button.Click += async (_, _) => await NavigateAsync(destination);
+        _navigationButtons[destination] = button;
+        return button;
+    }
+
+    private async Task NavigateAsync(string destination)
+    {
+        SelectNavigation(destination);
+        switch (destination)
+        {
+            case "ホーム":
+                _homeCard?.BringIntoView();
+                _homeCard?.Focus();
+                _status.Text = "ホーム: 動画を選択して字幕作成を開始できます。";
+                break;
+            case "字幕":
+                _captionGrid?.Focus();
+                if (_captionGrid?.CurrentItem is CaptionRow row) _captionGrid.ScrollIntoView(row);
+                _status.Text = "字幕: 一覧の本文を直接編集できます。文字を選択して「選択字幕を分解」も利用できます。";
+                break;
+            case "AI":
+                _status.Text = "AI: モデル管理を開いています。モデルのダウンロードは必ず確認後に開始されます。";
+                await ShowModelManagerAsync();
+                break;
+            case "スタイル":
+                ShowStyleWindow();
+                break;
+            case "出力":
+                await ExportAsync();
+                break;
+            case "設定":
+                ShowSettingsWindow();
+                break;
+        }
+    }
+
+    private void SelectNavigation(string destination)
+    {
+        foreach (var pair in _navigationButtons)
+        {
+            var selected = pair.Key == destination;
+            pair.Value.Background = selected
+                ? new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(37, 99, 235))
+                : System.Windows.Media.Brushes.Transparent;
+            pair.Value.FontWeight = selected ? FontWeights.SemiBold : FontWeights.Normal;
+        }
+    }
+
+    private void ShowStyleWindow()
+    {
+        var window = new Window { Title = "字幕スタイル", Owner = this, Width = 480, Height = 260, WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = ResizeMode.NoResize };
+        var panel = new StackPanel { Margin = new Thickness(20) };
+        panel.Children.Add(new TextBlock { Text = "字幕スタイル", FontSize = 20, FontWeight = FontWeights.SemiBold });
+        panel.Children.Add(new TextBlock { Text = "FAT標準スタイルを使うか、AviUtl2で保存した通常テキストの .object テンプレートを読み込めます。字幕の本文と時間は変更しません。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 12) });
+        var actions = new StackPanel { Orientation = Orientation.Horizontal };
+        var standard = AddButton(actions, "FAT標準スタイルを使う", (_, _) => { ApplyStandardStyle(); window.Close(); });
+        standard.Margin = new Thickness(0, 0, 8, 0);
+        AddButton(actions, "AviUtl2 .objectを読み込む", async (_, _) => { await RegisterObjectTemplateAsync(); window.Close(); });
+        panel.Children.Add(actions);
+        window.Content = panel;
+        window.ShowDialog();
+    }
+
+    private void ShowSettingsWindow()
+    {
+        var window = new Window { Title = "設定 / 更新", Owner = this, Width = 500, Height = 300, WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = ResizeMode.NoResize };
+        var panel = new StackPanel { Margin = new Thickness(20) };
+        panel.Children.Add(new TextBlock { Text = "認識と更新", FontSize = 20, FontWeight = FontWeights.SemiBold });
+        panel.Children.Add(new TextBlock { Text = "認識言語・字幕言語・認識プロファイルはホームの「詳細設定」から変更できます。アプリ更新はGitHub Releaseを確認し、ユーザーが選んだ場合だけインストーラーをダウンロードします。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 12) });
+        var advanced = AddButton(panel, "認識の詳細設定を開く", (_, _) => { _advancedSettings?.SetCurrentValue(Expander.IsExpandedProperty, true); _recognitionLanguage.Focus(); window.Close(); });
+        advanced.Margin = new Thickness(0, 0, 0, 8);
+        var update = AddButton(panel, "更新を確認", async (_, _) => await CheckForUpdatesAsync());
+        update.Margin = new Thickness(0, 0, 0, 8);
+        var releases = AddButton(panel, "GitHub Releaseを開く", (_, _) => Process.Start(new ProcessStartInfo(ReleasesPageUrl) { UseShellExecute = true }));
+        releases.Margin = new Thickness(0, 0, 0, 8);
+        var uninstall = AddButton(panel, "AviUtl2 FATをアンインストール...", (_, _) => StartUninstaller());
+        uninstall.ToolTip = "FATのみを削除します。AviUtl2本体や他のプラグインには変更を加えません。";
+        window.Content = panel;
+        window.ShowDialog();
+    }
+
+    private void StartUninstaller()
+    {
+        // The installer puts unins000.exe in the AviUtl2FAT plugin root while
+        // this executable lives in its FAT child directory.  Never attempt to
+        // delete files ourselves: Inno Setup owns removal and leaves AviUtl2
+        // plus unrelated plugins outside this directory untouched.
+        var pluginRoot = Directory.GetParent(AppContext.BaseDirectory)?.FullName;
+        var uninstaller = pluginRoot is null ? null : Path.Combine(pluginRoot, "unins000.exe");
+        if (string.IsNullOrWhiteSpace(uninstaller) || !File.Exists(uninstaller))
+        {
+            MessageBox.Show(this, "アンインストーラーはインストール済みのFATにだけ含まれます。\n\n現在は開発版または展開フォルダーから実行されています。Windowsの「インストールされているアプリ」から AviUtl2 FAT を選んで削除するか、FATをインストーラーで導入してください。", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var decision = MessageBox.Show(this, "AviUtl2 FAT をアンインストールしますか？\n\n削除対象は AviUtl2FAT フォルダー内の FAT 本体・Worker・runtime・ダウンロード済みモデルです。AviUtl2 本体、他のプラグイン、プロジェクトファイルには触れません。\n\nアプリ設定は %LOCALAPPDATA%\\AviUtl2FAT に残るため、再インストール時に引き継げます。", Title, MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        if (decision != MessageBoxResult.Yes) return;
+
+        Process.Start(new ProcessStartInfo(uninstaller) { UseShellExecute = true, WorkingDirectory = pluginRoot! });
+        Close();
+    }
+
+    private static HttpClient CreateUpdateClient()
+    {
+        var client = new HttpClient { Timeout = TimeSpan.FromSeconds(15) };
+        client.DefaultRequestHeaders.UserAgent.ParseAdd("AviUtl2FAT/1.0 UpdateCheck");
+        client.DefaultRequestHeaders.Accept.ParseAdd("application/vnd.github+json");
+        return client;
+    }
+
+    private async Task CheckForUpdatesAsync()
+    {
+        try
+        {
+            using var response = await UpdateClient.GetAsync(ReleasesApiUrl);
+            response.EnsureSuccessStatusCode();
+            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+            var latest = document.RootElement.EnumerateArray()
+                .FirstOrDefault(release => !release.GetProperty("draft").GetBoolean());
+            if (latest.ValueKind == JsonValueKind.Undefined)
+            {
+                MessageBox.Show(this, "公開済みの更新情報はまだありません。", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var tag = latest.GetProperty("tag_name").GetString() ?? "";
+            var current = ParseVersion(CurrentVersion);
+            var available = ParseVersion(tag);
+            if (available is null || current is null || available.CompareTo(current) <= 0)
+            {
+                MessageBox.Show(this, $"AviUtl2 FAT は最新です。\n\n現在: v{CurrentVersion}\n公開版: {tag}", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+                return;
+            }
+
+            var asset = latest.GetProperty("assets").EnumerateArray().FirstOrDefault(item =>
+                (item.GetProperty("name").GetString() ?? "").EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
+            var downloadUrl = asset.ValueKind == JsonValueKind.Undefined
+                ? latest.GetProperty("html_url").GetString()
+                : asset.GetProperty("browser_download_url").GetString();
+            var decision = MessageBox.Show(this, $"AviUtl2 FAT {tag} を利用できます。\n\n更新インストーラーを開きますか？\n実行中のAviUtl2 FATを閉じてからインストールしてください。", Title, MessageBoxButton.YesNo, MessageBoxImage.Information);
+            if (decision == MessageBoxResult.Yes && !string.IsNullOrWhiteSpace(downloadUrl))
+                Process.Start(new ProcessStartInfo(downloadUrl) { UseShellExecute = true });
+        }
+        catch (Exception error)
+        {
+            MessageBox.Show(this, "更新情報を取得できませんでした。ネットワーク接続を確認するか、GitHub Releaseを開いてください。\n\n" + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private static Version? ParseVersion(string value)
+    {
+        var normalized = value.Trim().TrimStart('v', 'V').Split('-', 2)[0];
+        return Version.TryParse(normalized, out var version) ? version : null;
+    }
+
+    private static string GetCurrentVersion()
+    {
+        var version = typeof(FatWindow).Assembly.GetName().Version;
+        return version is null ? "1.0.0" : version.ToString(3);
     }
 
     private static ComboBox LanguageSelector(string selected, bool includeAuto = true) { var box = new ComboBox { Width = 130, Margin = new Thickness(0, 0, 0, 8) }; if (includeAuto) box.Items.Add(new ComboBoxItem { Content = "自動判定", Tag = "auto" }); box.Items.Add(new ComboBoxItem { Content = "日本語", Tag = "ja" }); box.Items.Add(new ComboBoxItem { Content = "English", Tag = "en" }); box.SelectedItem = box.Items.Cast<ComboBoxItem>().First(x => (string)x.Tag == selected); return box; }
