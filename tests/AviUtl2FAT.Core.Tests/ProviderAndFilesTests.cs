@@ -62,6 +62,28 @@ public sealed class ProviderAndFilesTests
     }
 
     [Fact]
+    public async Task Placement_json_preserves_five_second_and_ten_second_gaps_as_absolute_frames()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"fat-gap-{Guid.NewGuid():N}.placement.json");
+        try
+        {
+            await FatFiles.WritePlacementAsync(path,
+                [
+                    new FATCaption("a", 0, 2, "", "A"),
+                    new FATCaption("b", 7, 9, "", "B"),
+                    new FATCaption("c", 19, 21, "", "C")
+                ],
+                60, CancellationToken.None);
+            using var document = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(path));
+            var items = document.RootElement.GetProperty("Items").EnumerateArray().ToArray();
+            Assert.Equal((0, 120), (items[0].GetProperty("StartFrame").GetInt32(), items[0].GetProperty("EndFrame").GetInt32()));
+            Assert.Equal((420, 540), (items[1].GetProperty("StartFrame").GetInt32(), items[1].GetProperty("EndFrame").GetInt32()));
+            Assert.Equal((1140, 1260), (items[2].GetProperty("StartFrame").GetInt32(), items[2].GetProperty("EndFrame").GetInt32()));
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
     public async Task Json_exports_are_utf8_atomic_and_do_not_leave_a_temp_file()
     {
         var path = Path.Combine(Path.GetTempPath(), $"fat-{Guid.NewGuid():N}.placement.json");
@@ -142,6 +164,27 @@ public sealed class ProviderAndFilesTests
     }
 
     [Fact]
+    public async Task Srt_exporter_preserves_short_and_long_gaps()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"fat-gap-{Guid.NewGuid():N}.srt");
+        try
+        {
+            await new SrtCaptionExporter().ExportAsync(path,
+                [
+                    new FATCaption("a", 0, 2, "", "A"),
+                    new FATCaption("b", 2.1, 4, "", "B"),
+                    new FATCaption("c", 14, 16, "", "C")
+                ],
+                CancellationToken.None);
+            var output = await File.ReadAllTextAsync(path);
+            Assert.Contains("00:00:00,000 --> 00:00:02,000", output, StringComparison.Ordinal);
+            Assert.Contains("00:00:02,100 --> 00:00:04,000", output, StringComparison.Ordinal);
+            Assert.Contains("00:00:14,000 --> 00:00:16,000", output, StringComparison.Ordinal);
+        }
+        finally { File.Delete(path); }
+    }
+
+    [Fact]
     public async Task Object_template_round_trips_and_replaces_only_verified_text_field()
     {
         var root = Path.Combine(Path.GetTempPath(), $"fat-object-{Guid.NewGuid():N}");
@@ -217,6 +260,41 @@ public sealed class ProviderAndFilesTests
     }
 
     [Fact]
+    public async Task Experimental_multi_object_export_preserves_absolute_gaps_and_records_gap_metadata()
+    {
+        var root = Path.Combine(Path.GetTempPath(), $"fat-multi-gap-{Guid.NewGuid():N}"); Directory.CreateDirectory(root);
+        var path = Path.Combine(root, "gap.object");
+        try
+        {
+            var result = await new AviUtl2MultiObjectExporter(AviUtl2ObjectTemplate.CreateStandard()).ExportAsync(path,
+                [new FATCaption("a", 0, 2, "", "A"), new FATCaption("b", 7, 9, "", "B"), new FATCaption("c", 19, 21, "", "C")],
+                60, new AviUtl2MultiObjectExportOptions(AviUtl2LayerPlacementMode.SingleLayer), CancellationToken.None);
+            var output = await File.ReadAllTextAsync(path);
+            Assert.Contains("[0]\r\nlayer=1\r\nframe=0,120", output, StringComparison.Ordinal);
+            Assert.Contains("[1]\r\nlayer=1\r\nframe=420,540", output, StringComparison.Ordinal);
+            Assert.Contains("[2]\r\nlayer=1\r\nframe=1140,1260", output, StringComparison.Ordinal);
+            Assert.Equal([1], result.UsedLayers);
+            using var manifest = System.Text.Json.JsonDocument.Parse(await File.ReadAllTextAsync(result.ManifestPath));
+            var timing = manifest.RootElement.GetProperty("timing").EnumerateArray().ToArray();
+            Assert.Equal(5, timing[1].GetProperty("GapBefore").GetDouble());
+            Assert.Equal(10, timing[2].GetProperty("GapBefore").GetDouble());
+        }
+        finally { Directory.Delete(root, true); }
+    }
+
+    [Fact]
+    public void Caption_splitter_only_redistributes_time_inside_the_split_caption()
+    {
+        var split = CaptionSplitter.Split(new FATCaption("a", 0, 6, "", "こんにちは。今日はAviUtl2 FATをかなり丁寧に紹介します。"), maximumCharacters: 8, maximumLines: 1);
+        var following = new FATCaption("b", 10, 12, "", "次の発話");
+        Assert.True(split.Count >= 2);
+        Assert.Equal(0, split[0].StartTime);
+        Assert.Equal(6, split[^1].EndTime);
+        Assert.Equal(10, following.StartTime);
+        Assert.Equal(4, following.StartTime - split[^1].EndTime);
+    }
+
+    [Fact]
     public async Task Experimental_multi_object_export_rejects_overlap_on_the_verified_single_layer()
     {
         var path = Path.Combine(Path.GetTempPath(), $"fat-multi-{Guid.NewGuid():N}.object");
@@ -281,7 +359,7 @@ public sealed class ProviderAndFilesTests
             var result = await exporter.ExportAsync(path, captions, 60, new AviUtl2MultiObjectExportOptions(AviUtl2LayerPlacementMode.SingleLayer), CancellationToken.None);
             var output = await File.ReadAllTextAsync(path);
             Assert.Equal([1], result.UsedLayers);
-            Assert.Contains("frame=0,503", output, StringComparison.Ordinal);
+            Assert.Contains("frame=0,504", output, StringComparison.Ordinal);
             Assert.Contains("frame=504,810", output, StringComparison.Ordinal);
         }
         finally { Directory.Delete(root, true); }

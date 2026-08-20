@@ -221,6 +221,39 @@ public sealed record AviUtl2MultiObjectExportOptions(
 
 public sealed record AviUtl2ObjectPlacement(FATCaption Caption, int ObjectIndex, int Layer, int StartFrame, int EndFrame);
 
+/// <summary>
+/// Absolute timing metadata derived from caption order.  Gap values are
+/// observational only: they are used for diagnostics, merge/split policy, and
+/// manifests, never to move captions earlier or close silence.
+/// </summary>
+public sealed record CaptionTimingGap(string CaptionId, double StartTime, double EndTime, double? GapBefore, double? GapAfter)
+{
+    public static IReadOnlyList<CaptionTimingGap> Calculate(IReadOnlyList<FATCaption> captions)
+    {
+        var ordered = captions
+            .Where(caption => caption.Enabled && !string.IsNullOrWhiteSpace(caption.Text))
+            .OrderBy(caption => caption.StartTime)
+            .Select((caption, order) => new { caption, order })
+            .OrderBy(item => item.caption.StartTime)
+            .ThenBy(item => item.order)
+            .Select(item => item.caption)
+            .ToArray();
+        var result = new CaptionTimingGap[ordered.Length];
+        for (var index = 0; index < ordered.Length; index++)
+        {
+            var previous = index > 0 ? ordered[index - 1] : null;
+            var next = index + 1 < ordered.Length ? ordered[index + 1] : null;
+            result[index] = new CaptionTimingGap(
+                ordered[index].Id,
+                ordered[index].StartTime,
+                ordered[index].EndTime,
+                previous is null ? null : Math.Max(0, ordered[index].StartTime - previous.EndTime),
+                next is null ? null : Math.Max(0, next.StartTime - ordered[index].EndTime));
+        }
+        return result;
+    }
+}
+
 public sealed record AviUtl2MultiObjectExportResult(
     string FilePath,
     int Exported,
@@ -315,14 +348,12 @@ public sealed class AviUtl2MultiObjectExporter(AviUtl2ObjectTemplate template, A
             else
             {
                 var previous = layerEnds[selected];
-                // AviUtl2 ranges are inclusive.  For two contiguous timestamps
-                // that round to the same frame, end the previous object one frame
-                // earlier rather than wrongly treating the captions as overlapping.
-                if (previous.EndFrame >= start)
-                {
-                    var prior = planned[previous.PlanIndex];
-                    planned[previous.PlanIndex] = prior with { EndFrame = Math.Max(prior.StartFrame, start - 1) };
-                }
+                // v1.0.4 Subtitle Gap Preservation:
+                // StartTime/EndTime are absolute caption timing.  Do not shorten
+                // the previous object to satisfy inclusive frame display rules;
+                // that would silently rewrite user/Whisper timing and can erase
+                // or distort gaps.  Overlap decisions remain time-based, while
+                // serialized frames stay direct conversions from each caption.
                 layerEnds[selected] = (previous.Layer, item.caption.EndTime, end, planned.Count);
             }
             planned.Add(new AviUtl2ObjectPlacement(item.caption, planned.Count, layerEnds[selected].Layer, start, end));
@@ -359,7 +390,8 @@ public sealed class AviUtl2MultiObjectExporter(AviUtl2ObjectTemplate template, A
                     start_time = placement.Caption.StartTime, end_time = placement.Caption.EndTime,
                     start_frame = placement.StartFrame, end_frame = placement.EndFrame, text = placement.Caption.Text,
                     style = _style, source_caption_id = placement.Caption.Id, split_source_id = placement.Caption.Id
-                }).ToArray()
+                }).ToArray(),
+                timing = CaptionTimingGap.Calculate(plan.Select(item => item.Caption).ToArray())
             };
             await AviUtl2ObjectTemplateParser.AtomicWriteAsync(manifestPath, JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true, Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping }), false, cancellationToken);
             File.Delete(incomplete);

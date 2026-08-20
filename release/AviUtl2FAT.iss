@@ -1,6 +1,6 @@
 #define AppName "AviUtl2 FAT"
 #ifndef AppVersion
-  #define AppVersion "1.0.3"
+  #define AppVersion "1.0.4"
 #endif
 #define AppPublisher "AviUtl2 FAT Project"
 #ifndef SourcePayload

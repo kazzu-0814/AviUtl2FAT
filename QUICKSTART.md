@@ -1,6 +1,6 @@
 # AviUtl2 FAT v1.0 — Quick Start
 
-1. Run `AviUtl2FAT-Setup-1.0.3-x64.exe` and select the existing AviUtl2 Plugin folder.
+1. Run `AviUtl2FAT-Setup-1.0.4-x64.exe` and select the existing AviUtl2 Plugin folder.
 2. In AviUtl2 choose **編集 → プラグイン → AviUtl2 FAT → FAT を開く**.
 3. Choose a video/audio file and click **字幕を作成**.
 4. When a Whisper model is required, use **AIモデル管理** and explicitly download it.
