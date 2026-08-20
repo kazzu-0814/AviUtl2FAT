@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <data name="AppTitle" xml:space="preserve"><value>AviUtl2 FAT</value></data>
+  <data name="ModelManager" xml:space="preserve"><value>Model manager</value></data>
+  <data name="RecognitionLanguage" xml:space="preserve"><value>Recognition language</value></data>
+  <data name="OutputLanguage" xml:space="preserve"><value>Caption output language</value></data>
+  <data name="NotInstalled" xml:space="preserve"><value>Not installed</value></data>
+</root>

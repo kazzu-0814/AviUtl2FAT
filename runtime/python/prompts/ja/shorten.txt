@@ -1,0 +1,5 @@
+以下の日本語字幕を意味を保ったまま短くしてください。字幕本文のみを返してください。
+PREVIOUS: {previous}
+CURRENT: {current}
+NEXT: {next}
+CAPTION:

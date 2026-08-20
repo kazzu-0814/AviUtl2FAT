@@ -1,0 +1,10 @@
+以下の字幕を自然な日本語に整えてください。
+条件:
+- 意味を変えない
+- 不要な説明を追加しない
+- 字幕本文のみを返す
+- 簡潔で読みやすくする
+PREVIOUS: {previous}
+CURRENT: {current}
+NEXT: {next}
+CAPTION:

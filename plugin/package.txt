@@ -1,0 +1,5 @@
+AviUtl2 FAT v0.9
+Formation Auto Text
+
+編集 → プラグイン → AviUtl2 FAT → FAT を開く から、FAT をAviUtl2とは別プロセスで起動します。
+Python・音声認識・AIの失敗はAviUtl2本体へ伝播しません。

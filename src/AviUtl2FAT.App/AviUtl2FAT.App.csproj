@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\AviUtl2FAT.Core\AviUtl2FAT.Core.csproj" />
+    <!-- Build the isolated worker before collecting its executable deployment files. -->
+    <ProjectReference Include="..\AviUtl2FAT.Worker\AviUtl2FAT.Worker.csproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+
+  <!--
+    The App starts the worker from AppContext.BaseDirectory.  Keep the complete
+    worker launch set beside the App so Debug builds and published layouts behave
+    identically; copying only the .exe would omit its runtimeconfig/deps files.
+  -->
+  <Target Name="CopyFatWorkerToAppOutput" AfterTargets="Build">
+    <ItemGroup>
+      <FatWorkerDeploymentFiles Include="$(MSBuildThisFileDirectory)..\AviUtl2FAT.Worker\bin\$(Configuration)\net8.0\AviUtl2FAT.Worker.exe" />
+      <FatWorkerDeploymentFiles Include="$(MSBuildThisFileDirectory)..\AviUtl2FAT.Worker\bin\$(Configuration)\net8.0\AviUtl2FAT.Worker.dll" />
+      <FatWorkerDeploymentFiles Include="$(MSBuildThisFileDirectory)..\AviUtl2FAT.Worker\bin\$(Configuration)\net8.0\AviUtl2FAT.Worker.deps.json" />
+      <FatWorkerDeploymentFiles Include="$(MSBuildThisFileDirectory)..\AviUtl2FAT.Worker\bin\$(Configuration)\net8.0\AviUtl2FAT.Worker.runtimeconfig.json" />
+    </ItemGroup>
+    <Copy SourceFiles="@(FatWorkerDeploymentFiles)" DestinationFolder="$(OutDir)" SkipUnchangedFiles="true" />
+  </Target>
+</Project>

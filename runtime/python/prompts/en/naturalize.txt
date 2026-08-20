@@ -1,0 +1,10 @@
+Rewrite the following subtitle in natural English.
+Requirements:
+- Preserve the original meaning.
+- Do not add explanations.
+- Return only the subtitle text.
+- Keep it concise and readable.
+PREVIOUS: {previous}
+CURRENT: {current}
+NEXT: {next}
+CAPTION:

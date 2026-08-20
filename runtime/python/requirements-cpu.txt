@@ -1,0 +1,6 @@
+-c constraints.txt
+faster-whisper>=1.1
+ctranslate2>=4.4
+huggingface-hub>=0.24
+av>=11
+numpy>=1.26

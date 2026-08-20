@@ -1,0 +1,2 @@
+-r requirements-cpu.txt
+# CUDA/cuDNNはCTranslate2とドライバーの対応版を別途用意してください。

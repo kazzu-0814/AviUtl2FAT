@@ -1,0 +1,5 @@
+Shorten the following English subtitle while preserving its meaning. Return only the subtitle text.
+PREVIOUS: {previous}
+CURRENT: {current}
+NEXT: {next}
+CAPTION:

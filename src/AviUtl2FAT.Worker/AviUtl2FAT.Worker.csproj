@@ -1,0 +1,4 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup><ProjectReference Include="..\AviUtl2FAT.Core\AviUtl2FAT.Core.csproj" /></ItemGroup>
+  <PropertyGroup><OutputType>Exe</OutputType></PropertyGroup>
+</Project>

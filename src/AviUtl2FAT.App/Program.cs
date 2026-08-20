@@ -1,0 +1,867 @@
+using System.Collections.ObjectModel;
+using System.ComponentModel;
+using System.Diagnostics;
+using System.IO;
+using System.IO.Pipes;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Text.Json;
+using System.Windows;
+using System.Windows.Controls;
+using Microsoft.Win32;
+using AviUtl2FAT.Core;
+
+namespace AviUtl2FAT.App;
+
+public sealed class CaptionRow(FATCaption caption) : INotifyPropertyChanged
+{
+    private string _text = caption.Text;
+    public string Id { get; } = caption.Id;
+    public double StartTime { get; } = caption.StartTime;
+    public double EndTime { get; } = caption.EndTime;
+    public string OriginalTranscript { get; } = caption.OriginalTranscript;
+    public string Text { get => _text; set { if (_text != value) { _text = value; Changed(); } } }
+    public string Provider { get; private set; } = caption.Provider;
+    public string? Model { get; private set; } = caption.Model;
+    public string Warning => CaptionQuality.Warning(ToCaption()) is { } warning ? "⚠ 要確認: " + warning : string.Empty;
+    public FATCaption ToCaption() => new(Id, StartTime, EndTime, OriginalTranscript, Text, Provider, Model, caption.Confidence, caption.Enabled, caption.DetectedLanguage, caption.OutputLanguage);
+    public void Apply(FATCaption caption) { _text = caption.Text; Provider = caption.Provider; Model = caption.Model; Changed(nameof(Text)); Changed(nameof(Warning)); }
+    public event PropertyChangedEventHandler? PropertyChanged;
+    private void Changed([CallerMemberName] string? name = null) { PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name)); if (name == nameof(Text)) PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Warning))); }
+}
+
+public sealed class FatWindow : Window
+{
+    private readonly TextBlock _media = new() { Text = "Media: not selected" };
+    private readonly TextBlock _status = new() { Text = "Ready" };
+    private readonly ProgressBar _progress = new() { Minimum = 0, Maximum = 100, Height = 18 };
+    private readonly ComboBox _recognitionLanguage = LanguageSelector("auto");
+    private readonly ComboBox _outputLanguage = LanguageSelector("ja", includeAuto: false);
+    private readonly ComboBox _recognitionProfile = RecognitionProfileSelector();
+    private readonly ComboBox _aiProvider = AiSelector();
+    private readonly TextBlock _aiState = new() { Text = "今回使用するAI: AIなし（高速）" };
+    private readonly ObservableCollection<CaptionRow> _captions = [];
+    private readonly ProviderRegistry _providers = ProviderRegistry.CreateDefault();
+    private readonly PersistentPythonWorker _pythonEngine = new();
+    private readonly RuleBasedProvider _ruleProvider = new();
+    private readonly CodexCliBackend _codexCli = new();
+    private readonly CodexAppServerBackend _codexAppServer = new();
+    private readonly ClaudeCodeCliBackend _claudeCode = new();
+    private readonly ComboBox _codexBackend = CodexBackendSelectorBox();
+    private readonly StackPanel _codexBackendRow = new() { Orientation = Orientation.Horizontal, Visibility = Visibility.Collapsed };
+    private readonly Button _recognizeButton;
+    private readonly Button _naturalizeButton;
+    private readonly Button _shortenButton;
+    private DataGrid? _captionGrid;
+    private CaptionRow? _editingCaption;
+    private int _textSelectionStart;
+    private int _textSelectionLength;
+    private IReadOnlyList<FATCaption> _lastGenerated = [];
+    private readonly Stack<IReadOnlyList<FATCaption>> _undo = new();
+    private AviUtl2ObjectTemplate _objectTemplate = AviUtl2ObjectTemplate.CreateStandard();
+    private AviUtl2TextStyle _style = AviUtl2TextStyle.Default;
+    private readonly string _aiSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
+    private string? _input;
+    private bool _isRecognizing;
+    private CancellationTokenSource? _recognitionCancellation;
+
+    public FatWindow()
+    {
+        Title = "AviUtl2 FAT v1.0 - Formation Auto Text"; Width = 1200; Height = 780; MinWidth = 980; MinHeight = 620;
+        var root = new Grid { Background = System.Windows.Media.Brushes.White };
+        root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
+        root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(300) });
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); Content = root;
+
+        var navigation = new StackPanel { Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(31, 41, 55)), Margin = new Thickness(0) };
+        navigation.Children.Add(new TextBlock { Text = "AviUtl2\nFAT", Foreground = System.Windows.Media.Brushes.White, FontSize = 22, FontWeight = FontWeights.Bold, Margin = new Thickness(20, 24, 8, 28) });
+        foreach (var item in new[] { "ホーム", "字幕", "AI", "スタイル", "出力", "設定" })
+            navigation.Children.Add(new Button { Content = item, HorizontalContentAlignment = HorizontalAlignment.Left, Foreground = System.Windows.Media.Brushes.White, Background = System.Windows.Media.Brushes.Transparent, BorderThickness = new Thickness(0), Padding = new Thickness(20, 11, 8, 11) });
+        Grid.SetColumn(navigation, 0); root.Children.Add(navigation);
+
+        var center = new DockPanel { Margin = new Thickness(28, 24, 20, 14) }; Grid.SetColumn(center, 1); root.Children.Add(center);
+        var heading = new StackPanel { Margin = new Thickness(0, 0, 0, 14) }; DockPanel.SetDock(heading, Dock.Top); center.Children.Add(heading);
+        heading.Children.Add(new TextBlock { Text = "動画から字幕を作成", FontSize = 27, FontWeight = FontWeights.SemiBold });
+        heading.Children.Add(new TextBlock { Text = "1. 動画を選ぶ 　→　2. 字幕を作る 　→　3. 必要ならAIで整える 　→　4. 自分で直す 　→　5. AviUtl2へ出力", Foreground = System.Windows.Media.Brushes.DimGray, Margin = new Thickness(0, 6, 0, 12) });
+        var homeCard = new Border { BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 232, 240)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Padding = new Thickness(18), Margin = new Thickness(0, 0, 0, 12) };
+        var home = new StackPanel(); homeCard.Child = home; heading.Children.Add(homeCard);
+        home.Children.Add(new TextBlock { Text = "まず動画を選んで、字幕を作成します", FontWeight = FontWeights.SemiBold, FontSize = 16 });
+        home.Children.Add(_media);
+        var primaryActions = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 12, 0, 0) };
+        AddButton(primaryActions, "動画を選択", (_, _) => ChooseMedia());
+        _recognizeButton = AddButton(primaryActions, "字幕を作成", async (_, _) => await ToggleRecognitionAsync());
+        _recognizeButton.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(37, 99, 235)); _recognizeButton.Foreground = System.Windows.Media.Brushes.White;
+        home.Children.Add(primaryActions);
+        var advanced = new Expander { Header = "詳細設定（通常は自動のままで大丈夫です）", Margin = new Thickness(0, 8, 0, 0) };
+        var details = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
+        details.Children.Add(new TextBlock { Text = "認識言語:", VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_recognitionLanguage);
+        details.Children.Add(new TextBlock { Text = "字幕言語:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_outputLanguage);
+        details.Children.Add(new TextBlock { Text = "音声認識:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_recognitionProfile);
+        advanced.Content = details; home.Children.Add(advanced);
+
+        var progressBox = new StackPanel { Margin = new Thickness(0, 0, 0, 12) }; DockPanel.SetDock(progressBox, Dock.Top); center.Children.Add(progressBox);
+        progressBox.Children.Add(new TextBlock { Text = "処理状況", FontWeight = FontWeights.SemiBold }); progressBox.Children.Add(_status); progressBox.Children.Add(_progress);
+        var grid = new DataGrid { AutoGenerateColumns = false, CanUserAddRows = false, ItemsSource = _captions, SelectionMode = DataGridSelectionMode.Extended, SelectionUnit = DataGridSelectionUnit.FullRow };
+        grid.Columns.Add(new DataGridTextColumn { Header = "Start", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.StartTime)) { StringFormat = "0.000" }, IsReadOnly = true, Width = 90 });
+        grid.Columns.Add(new DataGridTextColumn { Header = "End", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.EndTime)) { StringFormat = "0.000" }, IsReadOnly = true, Width = 90 });
+        grid.Columns.Add(new DataGridTextColumn { Header = "字幕（直接編集できます）", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.Text)) { UpdateSourceTrigger = System.Windows.Data.UpdateSourceTrigger.PropertyChanged }, Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
+        grid.Columns.Add(new DataGridTextColumn { Header = "確認", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.Warning)), IsReadOnly = true, Width = 220 });
+        _captionGrid = grid; center.Children.Add(grid);
+        grid.PreparingCellForEdit += (_, eventArgs) =>
+        {
+            if (eventArgs.Row.Item is not CaptionRow row || eventArgs.EditingElement is not TextBox editor) return;
+            _editingCaption = row;
+            void CaptureSelection(object? sender, EventArgs eventArgs) { _textSelectionStart = editor.SelectionStart; _textSelectionLength = editor.SelectionLength; }
+            editor.SelectionChanged += CaptureSelection;
+            editor.LostKeyboardFocus += CaptureSelection;
+            CaptureSelection(null, EventArgs.Empty);
+        };
+
+        var inspector = new StackPanel { Margin = new Thickness(8, 24, 24, 14) }; Grid.SetColumn(inspector, 2); root.Children.Add(inspector);
+        inspector.Children.Add(new TextBlock { Text = "字幕・AI", FontSize = 18, FontWeight = FontWeights.SemiBold });
+        inspector.Children.Add(new TextBlock { Text = "使用するAI", Margin = new Thickness(0, 16, 0, 4) }); inspector.Children.Add(_aiProvider);
+        _codexBackendRow.Children.Add(new TextBlock { Text = "Codex接続:", Margin = new Thickness(0, 0, 8, 8), VerticalAlignment = VerticalAlignment.Center }); _codexBackendRow.Children.Add(_codexBackend); inspector.Children.Add(_codexBackendRow);
+        inspector.Children.Add(_aiState);
+        var aiButtons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 10, 0, 6) };
+        _naturalizeButton = AddButton(aiButtons, "自然にする", async (_, _) => await TransformSelectedAsync(CaptionOperation.Naturalize));
+        _shortenButton = AddButton(aiButtons, "短くする", async (_, _) => await TransformSelectedAsync(CaptionOperation.Shorten)); inspector.Children.Add(aiButtons);
+        var splitButton = AddButton(inspector, "選択字幕を分解", async (_, _) => await SplitCaptionsAsync());
+        splitButton.ToolTip = "編集欄で文字を選択してから押すと、選択文字を独立した字幕として分割します。文字選択がない場合は行全体を自動分割します。";
+        AddButton(inspector, "選択字幕を統合", (_, _) => MergeSelectedCaptions());
+        AddButton(inspector, "元に戻す", (_, _) => Undo());
+        inspector.Children.Add(new Separator { Margin = new Thickness(0, 12, 0, 12) });
+        inspector.Children.Add(new TextBlock { Text = "出力", FontSize = 18, FontWeight = FontWeights.SemiBold });
+        AddButton(inspector, "AviUtl2へ出力", async (_, _) => await ExportAsync()).FontWeight = FontWeights.SemiBold;
+        AddButton(inspector, "テキスト統一", (_, _) => ApplyStandardStyle());
+        AddButton(inspector, "AviUtl2からスタイルを読み込む", async (_, _) => await RegisterObjectTemplateAsync());
+        AddButton(inspector, "AIモデル管理", async (_, _) => await ShowModelManagerAsync());
+
+        var statusBar = new TextBlock { Text = "Python Engine: 待機中　|　Whisper: 自動設定　|　AI: AIなし　|　AviUtl2: 別プロセスで安全に動作", Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(241, 245, 249)), Padding = new Thickness(18, 8, 18, 8), Foreground = System.Windows.Media.Brushes.DimGray };
+        Grid.SetRow(statusBar, 1); Grid.SetColumnSpan(statusBar, 3); root.Children.Add(statusBar);
+        var saved = AiSelectionSettingsStore.LoadAsync(_aiSettingsPath, CancellationToken.None).GetAwaiter().GetResult();
+        _codexCli.ConfigureExecutablePath(saved.CodexCliPath);
+        _codexAppServer.ConfigureExecutablePath(saved.CodexCliPath);
+        _claudeCode.ConfigureExecutablePath(saved.ClaudeCliPath);
+        _aiProvider.SelectedItem = _aiProvider.Items.Cast<ComboBoxItem>().FirstOrDefault(item => (string)item.Tag == saved.PreferredAIProvider) ?? _aiProvider.Items[0];
+        _codexBackend.SelectedItem = _codexBackend.Items.Cast<ComboBoxItem>().FirstOrDefault(item => (string)item.Tag == saved.CodexBackend) ?? _codexBackend.Items[0];
+        _aiProvider.SelectionChanged += async (_, _) => { UpdateAiState(); await SaveAiSettingsAsync(); };
+        _codexBackend.SelectionChanged += async (_, _) => await SaveAiSettingsAsync();
+        UpdateAiState();
+        Closed += (_, _) => { _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
+    }
+
+    private static ComboBox LanguageSelector(string selected, bool includeAuto = true) { var box = new ComboBox { Width = 130, Margin = new Thickness(0, 0, 0, 8) }; if (includeAuto) box.Items.Add(new ComboBoxItem { Content = "自動判定", Tag = "auto" }); box.Items.Add(new ComboBoxItem { Content = "日本語", Tag = "ja" }); box.Items.Add(new ComboBoxItem { Content = "English", Tag = "en" }); box.SelectedItem = box.Items.Cast<ComboBoxItem>().First(x => (string)x.Tag == selected); return box; }
+    private static ComboBox RecognitionProfileSelector() { var box = new ComboBox { Width = 120, Margin = new Thickness(0, 0, 0, 8) }; foreach (var item in new[] { ("自動", "auto"), ("高速", "low"), ("標準", "standard"), ("高精度", "high") }) box.Items.Add(new ComboBoxItem { Content = item.Item1, Tag = item.Item2 }); box.SelectedIndex = 0; return box; }
+    private static ComboBox AiSelector() { var box = new ComboBox { Width = 180, Margin = new Thickness(0, 0, 0, 8) }; foreach (var item in new[] { ("自動", "auto"), ("AIなし（高速）", "rule"), ("Gemma 4 E2B", "gemma:gemma-4-e2b-it"), ("Gemma 4 E4B", "gemma:gemma-4-e4b-it"), ("Gemma 4 12B", "gemma:gemma-4-12b-it"), ("Gemma 4 26B A4B", "gemma:gemma-4-26b-a4b-it"), ("OpenAI Codex", "codex"), ("Anthropic Claude Code", "claude-code") }) box.Items.Add(new ComboBoxItem { Content = item.Item1, Tag = item.Item2 }); box.SelectedIndex = 0; return box; }
+    private static ComboBox CodexBackendSelectorBox()
+    {
+        var box = new ComboBox { Width = 230, Margin = new Thickness(0, 0, 0, 8) };
+        box.Items.Add(new ComboBoxItem { Content = "自動（接続済みApp Server優先）", Tag = "auto" });
+        box.Items.Add(new ComboBoxItem { Content = "Codex App Server", Tag = "appserver" });
+        box.Items.Add(new ComboBoxItem { Content = "Codex CLI", Tag = "cli" });
+        box.SelectedIndex = 0;
+        return box;
+    }
+    private static string SelectedLanguage(ComboBox box) => (string)((ComboBoxItem)box.SelectedItem).Tag;
+    private string SelectedAi() => (string)((ComboBoxItem)_aiProvider.SelectedItem).Tag;
+    private CodexBackendPreference SelectedCodexBackend() => (string)((ComboBoxItem)_codexBackend.SelectedItem).Tag switch { "appserver" => CodexBackendPreference.AppServer, "cli" => CodexBackendPreference.Cli, _ => CodexBackendPreference.Auto };
+    private Task SaveAiSettingsAsync() => AiSelectionSettingsStore.SaveAsync(_aiSettingsPath, new AiSelectionSettings(PreferredAIProvider: SelectedAi(), CodexBackend: (string)((ComboBoxItem)_codexBackend.SelectedItem).Tag, CodexCliPath: _codexCli.ExecutablePath, ClaudeCliPath: _claudeCode.ExecutablePath), CancellationToken.None);
+    private void UpdateAiState()
+    {
+        var selected = SelectedAi();
+        _codexBackendRow.Visibility = selected == "codex" ? Visibility.Visible : Visibility.Collapsed;
+        _aiState.Text = selected switch
+        {
+            "codex" => "今回使用するAI: OpenAI Codex（字幕本文を外部AIサービスへ送信します）",
+            "claude-code" => "今回使用するAI: Anthropic Claude Code（字幕本文を外部AIサービスへ送信します）",
+            var gemma when gemma.StartsWith("gemma:", StringComparison.Ordinal) => $"今回使用するAI: {_aiProvider.Text}（ローカルAI・モデル読み込みが必要です）",
+            "auto" => "今回使用するAI: 自動（クラウドAIへは自動送信しません）",
+            _ => "今回使用するAI: AIなし（Python ルール処理・外部送信なし）"
+        };
+    }
+    private static Button AddButton(Panel panel, string text, RoutedEventHandler handler)
+    {
+        var button = new Button { Content = text, Margin = new Thickness(0, 0, 8, 8), Padding = new Thickness(12, 6, 12, 6) }.With(handler);
+        panel.Children.Add(button);
+        return button;
+    }
+    private void ChooseMedia() { var dialog = new OpenFileDialog { Filter = "動画・音声|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.m4a;*.wav;*.flac|すべてのファイル|*.*" }; if (dialog.ShowDialog(this) == true) { _input = dialog.FileName; _media.Text = $"動画素材: {Path.GetFileName(_input)}"; } }
+    private async Task ToggleRecognitionAsync()
+    {
+        if (_isRecognizing)
+        {
+            _recognizeButton.IsEnabled = false;
+            _recognizeButton.Content = "停止中...";
+            _status.Text = "停止を要求しています...";
+            _recognitionCancellation?.Cancel();
+            return;
+        }
+
+        await RecognizeAsync();
+    }
+
+    private async Task RecognizeAsync()
+    {
+        if (string.IsNullOrWhiteSpace(_input)) { Error("FAT_INPUT_REQUIRED", "Choose a media file first."); return; }
+        if (_isRecognizing) return;
+        _isRecognizing = true;
+        _recognitionCancellation = new CancellationTokenSource();
+        _recognizeButton.Content = "停止";
+        try
+        {
+            _progress.Value = 0; _status.Text = "Starting worker...";
+            var output = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", $"{Guid.NewGuid():N}.att.json");
+            var recognitionLanguage = SelectedLanguage(_recognitionLanguage); var outputLanguage = SelectedLanguage(_outputLanguage);
+            await RunWorkerAsync(new RecognitionRequest(_input, output, new FatSettings { Version = "1.0.0", Language = recognitionLanguage, RecognitionLanguage = recognitionLanguage, CaptionOutputLanguage = outputLanguage, SpeechProfile = (string)((ComboBoxItem)_recognitionProfile.SelectedItem).Tag }), p => { _status.Text = p.Message; if (p.Value is not null) _progress.Value = Math.Clamp(p.Value.Value, 0, 100); }, _recognitionCancellation.Token);
+            var transcript = await FatFiles.ReadAttTranscriptAsync(output, CancellationToken.None);
+            var response = await _providers.GetRequired("passthrough").GenerateCaptionsAsync(new CaptionGenerationRequest(transcript), CancellationToken.None);
+            _lastGenerated = response.Captions; Load(response.Captions); _progress.Value = 100; _status.Text = $"完了: {_captions.Count} 件の字幕を編集できます。";
+        }
+        catch (OperationCanceledException) { _status.Text = "字幕生成を停止しました。既存の字幕はそのまま保持されています。"; }
+        catch (FatException exception) { Error(exception.Code, exception.Message); }
+        catch (Exception exception) { Error("FAT_APP_UNEXPECTED", exception.Message); }
+        finally
+        {
+            _recognitionCancellation?.Dispose();
+            _recognitionCancellation = null;
+            _isRecognizing = false;
+            _recognizeButton.Content = "字幕を作成";
+            _recognizeButton.IsEnabled = true;
+        }
+    }
+    private async Task RegenerateAsync() { try { var transcript = _captions.Select(x => new TranscriptSegment(x.Id, x.StartTime, x.EndTime, x.OriginalTranscript, x.Text)).ToArray(); var response = await _providers.GetRequired("passthrough").GenerateCaptionsAsync(new CaptionGenerationRequest(transcript), CancellationToken.None); _lastGenerated = response.Captions; Load(response.Captions); _status.Text = "Regenerated with Passthrough."; } catch (FatException exception) { Error(exception.Code, exception.Message); } }
+    private async Task TransformSelectedAsync(CaptionOperation operation)
+    {
+        var selected = _captionGrid?.SelectedItems.Cast<CaptionRow>().Select(row => row.ToCaption()).ToArray() ?? [];
+        if (selected.Length == 0) { Error("FAT_AI_SELECTION_REQUIRED", "字幕一覧から処理する字幕を1件以上選択してください。"); return; }
+        var providerId = SelectedAi();
+        if (providerId == "auto") providerId = "rule"; // Cloud providers are never selected implicitly.
+        if (providerId == "codex" && MessageBox.Show(this, "OpenAI Codexを使用すると、選択した字幕本文のみが外部AIサービスへ送信されます。動画ファイルや認証情報は送信しません。\n\n続行しますか？", Title, MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        if (providerId == "claude-code" && MessageBox.Show(this, "Anthropic Claude Codeを使用します。\n\n選択した字幕本文だけがAnthropicのサービスへ送信されます。動画・AviUtl2プロジェクト・認証情報は送信しません。\nAI結果は自動確定されず、確認・編集してから適用します。\n\n使用しますか？", Title, MessageBoxButton.OKCancel, MessageBoxImage.Warning) != MessageBoxResult.OK) return;
+        _naturalizeButton.IsEnabled = _shortenButton.IsEnabled = false;
+        try
+        {
+            _status.Text = providerId == "codex" ? "OpenAI Codexで字幕を処理しています..." : providerId == "claude-code" ? "Anthropic Claude Codeで字幕を処理しています..." : "字幕を処理しています...";
+            var request = new CaptionTransformRequest(selected, operation, SelectedLanguage(_outputLanguage));
+            CaptionTransformResponse response = providerId switch
+            {
+                "codex" => await TransformWithCodexAsync(request),
+                "claude-code" => await TransformWithClaudeAsync(request),
+                var gemma when gemma.StartsWith("gemma:", StringComparison.Ordinal) => await TransformWithGemmaAsync(request, gemma[6..]),
+                _ => await _ruleProvider.TransformAsync(request, CancellationToken.None)
+            };
+            var preview = new AiPreviewWindow(selected, response.Captions, response.Provider, response.Backend, operation) { Owner = this };
+            if (preview.ShowDialog() != true) { _status.Text = "AI変更案は適用しませんでした。"; return; }
+            var before = _captions.Select(row => row.ToCaption()).ToArray(); _undo.Push(before); _lastGenerated = before;
+            foreach (var changed in preview.Result) _captions.FirstOrDefault(row => row.Id == changed.Id)?.Apply(changed);
+            _status.Text = $"{response.Provider} の変更案を適用しました。元に戻すことができます。";
+        }
+        catch (FatException error) { Error(error.Code, error.Message); }
+        catch (Exception error) { Error("FAT_AI_FAILED", error.Message); }
+        finally { _naturalizeButton.IsEnabled = _shortenButton.IsEnabled = true; }
+    }
+    private async Task<CaptionTransformResponse> TransformWithCodexAsync(CaptionTransformRequest request)
+    {
+        var selected = await CodexBackendSelector.SelectAsync(SelectedCodexBackend(), _codexAppServer, _codexCli, CancellationToken.None);
+        return await new CodexProvider(selected.Backend).TransformAsync(request, CancellationToken.None);
+    }
+    private Task<CaptionTransformResponse> TransformWithClaudeAsync(CaptionTransformRequest request) => new ClaudeCodeProvider(_claudeCode).TransformAsync(request, CancellationToken.None);
+    private async Task<CaptionTransformResponse> TransformWithGemmaAsync(CaptionTransformRequest request, string modelId)
+    {
+        var payload = JsonSerializer.Serialize(new { provider = "gemma", model_id = modelId, operation = request.Operation == CaptionOperation.Naturalize ? "naturalize" : "shorten", output_language = request.OutputLanguage, captions = request.Captions.Select(caption => new { id = caption.Id, start_time = caption.StartTime, end_time = caption.EndTime, original_transcript = caption.OriginalTranscript, text = caption.Text, confidence = caption.Confidence }) }, JsonOptions);
+        var response = await _pythonEngine.RequestAsync(FindRuntime(AppContext.BaseDirectory), request.Operation == CaptionOperation.Naturalize ? "ai.naturalize" : "ai.shorten", payload);
+        using var document = JsonDocument.Parse(response); var root = document.RootElement;
+        if (root.GetProperty("type").GetString() == "error") throw new FatException("GEMMA_FAILED", root.GetProperty("error").GetProperty("message").GetString() ?? "Gemma failed.");
+        var captions = root.GetProperty("payload").GetProperty("captions").EnumerateArray().Select(item => new FATCaption(item.GetProperty("id").GetString()!, item.GetProperty("start_time").GetDouble(), item.GetProperty("end_time").GetDouble(), item.GetProperty("original_transcript").GetString() ?? "", item.GetProperty("text").GetString() ?? "", item.GetProperty("provider").GetString() ?? "gemma", item.TryGetProperty("model", out var model) && model.ValueKind != JsonValueKind.Null ? model.GetString() : null)).ToArray();
+        return new CaptionTransformResponse(captions, "gemma", modelId, "Python");
+    }
+    private async Task RegisterObjectTemplateAsync()
+    {
+        var dialog = new OpenFileDialog { Filter = "AviUtl2用オブジェクト|*.object" };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            _objectTemplate = await AviUtl2ObjectTemplateParser.LoadAsync(dialog.FileName, CancellationToken.None);
+            _style = _objectTemplate.ReadKnownStyle();
+            _status.Text = $"AviUtl2からスタイルを読み込みました: {Path.GetFileName(dialog.FileName)}";
+        }
+        catch (FatException exception) { Error(exception.Code, exception.Message); }
+    }
+    private void ApplyStandardStyle()
+    {
+        _objectTemplate = AviUtl2ObjectTemplate.CreateStandard(_style);
+        _status.Text = "FAT標準スタイルを全字幕の出力へ適用します。字幕本文・時間は変更しません。";
+    }
+    private Task SplitCaptionsAsync()
+    {
+        _captionGrid?.CommitEdit(DataGridEditingUnit.Cell, true);
+        _captionGrid?.CommitEdit(DataGridEditingUnit.Row, true);
+        var selected = SelectedCaptionRows();
+        if (selected.Count == 0) { Error("FAT_SPLIT_SELECTION_REQUIRED", "分解したい字幕の行をクリックしてから実行してください。"); return Task.CompletedTask; }
+        var before = _captions.Select(row => row.ToCaption()).ToArray();
+        try
+        {
+            _status.Text = "字幕を読みやすく分解しています...";
+            // Splitting must work while Python/Whisper/Codex are unavailable.
+            // It also avoids serializing user-edited quotation marks or newlines
+            // through a second JSON Lines boundary.
+            var selectedIds = selected.Select(row => row.Id).ToHashSet(StringComparer.Ordinal);
+            var manualRowId = _editingCaption?.Id;
+            var useTextSelection = _textSelectionLength > 0 && manualRowId is not null && selectedIds.Contains(manualRowId);
+            var values = before.SelectMany(caption =>
+            {
+                if (useTextSelection && caption.Id == manualRowId)
+                    return CaptionSplitter.SplitSelection(caption, _textSelectionStart, _textSelectionLength, minimumSeconds: 0.8);
+                return selectedIds.Contains(caption.Id)
+                    ? CaptionSplitter.Split(caption, maximumCharacters: 24, maximumLines: 2, minimumSeconds: 0.8)
+                    : [caption];
+            }).ToArray();
+            _undo.Push(before); _lastGenerated = before; Load(values); _status.Text = $"字幕を {_captions.Count} 件へ分解しました。内容はそのまま編集できます。";
+        }
+        catch (Exception error) { Error("FAT_SPLIT_FAILED", error.Message); }
+        return Task.CompletedTask;
+    }
+
+    private IReadOnlyList<CaptionRow> SelectedCaptionRows()
+    {
+        if (_captionGrid is null) return [];
+        var selected = _captionGrid.SelectedItems.Cast<CaptionRow>().ToArray();
+        // When text is being edited, WPF's CurrentItem is the reliable focus
+        // indicator even before the multi-selection collection has updated.
+        if (selected.Length == 0 && _captionGrid.CurrentItem is CaptionRow focused) return [focused];
+        return selected;
+    }
+
+    private void MergeSelectedCaptions()
+    {
+        var selected = SelectedCaptionRows().OrderBy(row => row.StartTime).ThenBy(row => row.EndTime).ToArray();
+        if (selected.Length < 2)
+        {
+            Error("FAT_MERGE_SELECTION_REQUIRED", "統合したい字幕を2件以上、Ctrlキーを押しながら選択してください。");
+            return;
+        }
+
+        var before = _captions.Select(row => row.ToCaption()).ToArray();
+        var values = selected.Select(row => row.ToCaption()).ToArray();
+        var merged = values[0] with
+        {
+            StartTime = values.Min(caption => caption.StartTime),
+            EndTime = values.Max(caption => caption.EndTime),
+            OriginalTranscript = string.Join("\n", values.Select(caption => caption.OriginalTranscript).Where(text => !string.IsNullOrWhiteSpace(text))),
+            Text = MergeCaptionText(values.Select(caption => caption.Text))
+        };
+        var selectedIds = selected.Select(row => row.Id).ToHashSet(StringComparer.Ordinal);
+        var insertAt = _captions.TakeWhile(row => !selectedIds.Contains(row.Id)).Count();
+        var result = before.Where(caption => !selectedIds.Contains(caption.Id)).ToList();
+        result.Insert(Math.Min(insertAt, result.Count), merged);
+        _undo.Push(before); _lastGenerated = before; Load(result);
+        _status.Text = $"{selected.Length} 件の字幕を1件へ統合しました。本文は引き続き直接編集できます。";
+    }
+
+    private static string MergeCaptionText(IEnumerable<string> texts)
+    {
+        var result = string.Empty;
+        foreach (var value in texts.Select(text => (text ?? string.Empty).Trim()).Where(text => text.Length > 0))
+        {
+            var insertSpace = result.Length > 0 && char.IsLetterOrDigit(result[^1]) && char.IsLetterOrDigit(value[0]);
+            result += (insertSpace ? " " : string.Empty) + value;
+        }
+        return result;
+    }
+    private static string FindRuntime(string appBase)
+    {
+        for (var current = new DirectoryInfo(appBase); current is not null; current = current.Parent)
+        {
+            var candidate = Path.Combine(current.FullName, "runtime");
+            if (HasPythonEngine(candidate)) return candidate;
+        }
+        return Path.Combine(appBase, "runtime");
+    }
+    private static bool HasPythonEngine(string runtime) =>
+        (File.Exists(Path.Combine(runtime, "python-runtime", "python.exe")) || File.Exists(Path.Combine(runtime, "python-env", "Scripts", "python.exe"))) &&
+        File.Exists(Path.Combine(runtime, "python", "fat_worker.py"));
+    private async Task ExportAsync()
+    {
+        if (_captions.Count == 0) { Error("FAT_NO_CAPTIONS", "There are no captions to export."); return; }
+        // One .object is the practical default.  The legacy one-caption-per-file
+        // exporter remains available as an explicitly named compatibility option.
+        var dialog = new SaveFileDialog { Filter = "AviUtl2用オブジェクト（一括・Experimental）|*.object|AviUtl2用オブジェクト（個別ファイル・互換用）|*.object|Placement JSON|*.placement.json|SRT字幕|*.srt|TXT|*.txt", FilterIndex = 1, FileName = "fat-captions" };
+        if (dialog.ShowDialog(this) != true) return;
+        var captions = _captions.Select(x => x.ToCaption()).ToArray();
+        try
+        {
+            switch (dialog.FilterIndex)
+            {
+                case 1:
+                    var optionsDialog = new MultiObjectExportOptionsWindow(captions, _objectTemplate, _style, 60) { Owner = this };
+                    if (optionsDialog.ShowDialog() != true) return;
+                    _status.Text = "Experimental一括.objectを書き出しています...";
+                    var multi = await new AviUtl2MultiObjectExporter(_objectTemplate, _style).ExportAsync(dialog.FileName, captions, 60, optionsDialog.Options, CancellationToken.None);
+                    _progress.Value = 100; _status.Text = $"Experimental一括.objectを保存しました: {multi.Exported} 件（Layer {string.Join(", ", multi.UsedLayers)}）";
+                    Process.Start(new ProcessStartInfo(Path.GetDirectoryName(dialog.FileName) ?? ".") { UseShellExecute = true });
+                    break;
+                case 2:
+                    var folder = Path.Combine(Path.GetDirectoryName(dialog.FileName) ?? ".", $"FAT_Object_Export_{DateTime.Now:yyyyMMdd_HHmmss}");
+                    _progress.Value = 0; _status.Text = "互換用の個別AviUtl2オブジェクトを書き出しています...";
+                    var result = await new AviUtl2ObjectExporter(_objectTemplate, _style).ExportAsync(folder, captions, 60, new Progress<(int Current, int Total)>(value => { _progress.Value = value.Total == 0 ? 0 : value.Current * 100d / value.Total; _status.Text = $"互換用の個別オブジェクトを書き出しています: {value.Current} / {value.Total}"; }), CancellationToken.None);
+                    _progress.Value = 100; _status.Text = $"完了: {result.Exported} 件を個別出力しました。";
+                    Process.Start(new ProcessStartInfo(folder) { UseShellExecute = true });
+                    break;
+                case 3: await FatFiles.WritePlacementAsync(dialog.FileName, captions, 30, CancellationToken.None); _status.Text = "Placement JSONを保存しました。"; break;
+                case 4: await new SrtCaptionExporter().ExportAsync(dialog.FileName, captions, CancellationToken.None); _status.Text = "SRTを保存しました。"; break;
+                case 5: await new TxtCaptionExporter().ExportAsync(dialog.FileName, captions, CancellationToken.None); _status.Text = "TXTを保存しました。"; break;
+            }
+        }
+        catch (FatException exception) { Error(exception.Code, exception.Message); }
+    }
+    private async Task ShowModelManagerAsync()
+    {
+        var window = new ModelManagerWindow(AppContext.BaseDirectory, _pythonEngine, _codexCli, _codexAppServer, _claudeCode);
+        window.Owner = this;
+        try { await window.RefreshAsync(); }
+        catch (Exception error) { window.ShowRefreshFailure(error); }
+        // The manager is always a child of the FAT main window.  It must never
+        // become Application.MainWindow or leave the application without a visible owner.
+        window.ShowDialog();
+        Activate();
+    }
+    private void Undo()
+    {
+        if (_undo.TryPop(out var captions)) { Load(captions); _status.Text = "直前の変更を元に戻しました。"; }
+        else if (_lastGenerated.Count > 0) { Load(_lastGenerated); _status.Text = "認識直後の字幕へ戻しました。"; }
+        else Error("FAT_UNDO_EMPTY", "元に戻せる変更がありません。");
+    }
+    private void Load(IReadOnlyList<FATCaption> captions) { _captions.Clear(); foreach (var caption in captions) _captions.Add(new CaptionRow(caption)); _editingCaption = null; _textSelectionStart = 0; _textSelectionLength = 0; }
+    private void Error(string code, string message)
+    {
+        _status.Text = $"Error ({code})";
+        var guidance = code switch
+        {
+            "FAT_INPUT_REQUIRED" => "動画または音声ファイルを選択してから実行してください。",
+            "FAT_RUNTIME_MISSING" or "FAT_WORKER_MISSING" => "FATを再インストールし、runtime フォルダが揃っているか確認してください。",
+            "FAT_FFMPEG_MISSING" => "FAT runtime 内の ffmpeg と ffprobe を確認してください。",
+            "FAT_OUTPUT_WRITE_FAILED" => "保存先の書き込み権限と、同名ファイルが他のアプリで開かれていないか確認してください。",
+            "OBJECT_MULTI_OVERLAP_UNSUPPORTED" => "「自動レイヤー」を選ぶか、字幕の時間重なりを編集してください。",
+            "CODEX_UNAVAILABLE" or "CODEX_APP_SERVER_DISCONNECTED" => "Codexを使わない場合は「AIなし」を選べます。Codexを使う場合は接続を確認してください。",
+            _ => "字幕一覧の内容は保持されています。内容を確認してから、もう一度実行してください。"
+        };
+        MessageBox.Show(this, $"{message}\n\n対処: {guidance}\n\n詳細コード: {code}", Title, MessageBoxButton.OK, MessageBoxImage.Error);
+    }
+    private async Task RunWorkerAsync(RecognitionRequest request, Action<FatProgress> progress, CancellationToken cancellationToken)
+    {
+        var pipeName = $"AviUtl2FAT-{Guid.NewGuid():N}"; var worker = Path.Combine(AppContext.BaseDirectory, "AviUtl2FAT.Worker.exe");
+        if (!File.Exists(worker)) throw new FatException("FAT_WORKER_MISSING", "AviUtl2FAT.Worker.exe was not found.");
+        using var process = Process.Start(new ProcessStartInfo(worker, $"--pipe {pipeName}") { UseShellExecute = false, CreateNoWindow = true }) ?? throw new FatException("FAT_WORKER_START_FAILED", "FAT Worker could not be started.");
+        using var cancellationRegistration = cancellationToken.Register(() => { try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { } });
+        await using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+        try { await pipe.ConnectAsync(10_000, cancellationToken); }
+        catch (TimeoutException error) { throw new FatException("FAT_WORKER_CONNECT_TIMEOUT", "音声認識ワーカーの起動がタイムアウトしました。FATを再起動してもう一度実行してください。", error); }
+        using var reader = new StreamReader(pipe, new UTF8Encoding(false), false, leaveOpen: true); await using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
+        await writer.WriteLineAsync(JsonSerializer.Serialize(new FatIpcMessage("recognize", Guid.NewGuid().ToString("N"), request), JsonOptions));
+        while (await reader.ReadLineAsync(cancellationToken) is { } line) { var message = JsonSerializer.Deserialize<FatIpcMessage>(line, JsonOptions); if (message is null) continue; FatProtocols.Validate(message.Protocol, message.Version, FatProtocols.AppProtocol); if (message.Type == "error") throw new FatException(message.Error?.Code ?? "FAT_WORKER_ERROR", message.Error?.Message ?? "Worker failed."); if (message.Type == "completed") return; if (message.Type == "progress" && message.Payload is JsonElement payload) { var value = payload.TryGetProperty("value", out var number) && number.ValueKind == JsonValueKind.Number ? number.GetDouble() : (double?)null; var text = payload.TryGetProperty("message", out var item) ? item.GetString() ?? "Working..." : "Working..."; progress(new FatProgress("recognition", value, text)); } }
+        throw new FatException("FAT_WORKER_DISCONNECTED", "Worker disconnected before completion.");
+    }
+    private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
+}
+
+/// <summary>Explicit confirmation and a read-only layer preview for the experimental .object exporter.</summary>
+public sealed class MultiObjectExportOptionsWindow : Window
+{
+    private readonly IReadOnlyList<FATCaption> _captions;
+    private readonly AviUtl2ObjectTemplate _template;
+    private readonly AviUtl2TextStyle _style;
+    private readonly double _fps;
+    private readonly ComboBox _mode = new() { Width = 220 };
+    private readonly TextBox _startLayer = new() { Text = "1", Width = 72 };
+    private readonly TextBox _maxLayers = new() { Text = "8", Width = 72 };
+    private readonly TextBox _gapFrames = new() { Text = "0", Width = 72 };
+    private readonly TextBlock _preview = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 10, 0, 8) };
+    public AviUtl2MultiObjectExportOptions Options { get; private set; } = new();
+
+    public MultiObjectExportOptionsWindow(IReadOnlyList<FATCaption> captions, AviUtl2ObjectTemplate template, AviUtl2TextStyle style, double fps)
+    {
+        _captions = captions; _template = template; _style = style; _fps = fps;
+        Title = "一括 .object 出力（Experimental）"; Width = 590; Height = 430; MinWidth = 520; WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        var panel = new StackPanel { Margin = new Thickness(20) }; Content = panel;
+        panel.Children.Add(new TextBlock { Text = "複数の通常テキストを1つの .object にまとめます", FontSize = 18, FontWeight = FontWeights.SemiBold });
+        panel.Children.Add(new TextBlock { Text = "実機で確認済みの複数オブジェクト形式を使います。最初は2件で読み込みを確認してください。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 6, 0, 12) });
+        _mode.Items.Add(new ComboBoxItem { Content = "自動レイヤー（重なり時だけ分散）", Tag = AviUtl2LayerPlacementMode.Auto });
+        _mode.Items.Add(new ComboBoxItem { Content = "単一レイヤー（重なりはエラー）", Tag = AviUtl2LayerPlacementMode.SingleLayer });
+        _mode.Items.Add(new ComboBoxItem { Content = "手動レイヤー（指定レイヤー固定）", Tag = AviUtl2LayerPlacementMode.Manual });
+        _mode.SelectedIndex = 0;
+        AddRow(panel, "配置方式:", _mode);
+        AddRow(panel, "開始レイヤー:", _startLayer);
+        AddRow(panel, "自動レイヤー上限:", _maxLayers);
+        AddRow(panel, "最小間隔（frame）:", _gapFrames);
+        panel.Children.Add(_preview);
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right };
+        var cancel = new Button { Content = "キャンセル", Margin = new Thickness(0, 0, 8, 0), Padding = new Thickness(14, 6, 14, 6) };
+        cancel.Click += (_, _) => DialogResult = false;
+        var export = new Button { Content = "一括 .object を保存", Padding = new Thickness(14, 6, 14, 6) };
+        export.Click += (_, _) => Confirm(); buttons.Children.Add(cancel); buttons.Children.Add(export); panel.Children.Add(buttons);
+        _mode.SelectionChanged += (_, _) => UpdatePreview(); _startLayer.TextChanged += (_, _) => UpdatePreview(); _maxLayers.TextChanged += (_, _) => UpdatePreview(); _gapFrames.TextChanged += (_, _) => UpdatePreview();
+        UpdatePreview();
+    }
+
+    private static void AddRow(Panel panel, string label, FrameworkElement input)
+    {
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 3, 0, 3) };
+        row.Children.Add(new TextBlock { Text = label, Width = 150, VerticalAlignment = VerticalAlignment.Center }); row.Children.Add(input); panel.Children.Add(row);
+    }
+    private AviUtl2MultiObjectExportOptions ReadOptions() => new AviUtl2MultiObjectExportOptions((AviUtl2LayerPlacementMode)((ComboBoxItem)_mode.SelectedItem).Tag,
+        int.TryParse(_startLayer.Text, out var start) ? start : 0, int.TryParse(_maxLayers.Text, out var max) ? max : 0,
+        int.TryParse(_gapFrames.Text, out var gap) ? gap : -1).Validate();
+    private void UpdatePreview()
+    {
+        try
+        {
+            var plan = new AviUtl2MultiObjectExporter(_template, _style).Plan(_captions, _fps, ReadOptions());
+            var layers = plan.Select(item => item.Layer).Distinct().Order().ToArray();
+            _preview.Text = $"プレビュー: {plan.Count} 件 / 使用レイヤー {string.Join(", ", layers)} / 範囲 Layer {layers.First()}–{layers.Last()}\n同じ開始時刻は、字幕一覧の順序を維持します。";
+        }
+        catch (FatException error) { _preview.Text = $"この設定では出力できません: {error.Message}"; }
+    }
+    private void Confirm()
+    {
+        try { Options = ReadOptions(); _ = new AviUtl2MultiObjectExporter(_template, _style).Plan(_captions, _fps, Options); DialogResult = true; }
+        catch (FatException error) { MessageBox.Show(this, error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning); }
+    }
+}
+
+public sealed class AiPreviewWindow : Window
+{
+    private readonly IReadOnlyList<FATCaption> _original;
+    private IReadOnlyList<FATCaption> _result;
+    private readonly TextBox _editor = new() { AcceptsReturn = true, TextWrapping = TextWrapping.Wrap, MinHeight = 80 };
+    public IReadOnlyList<FATCaption> Result => _result;
+    public AiPreviewWindow(IReadOnlyList<FATCaption> original, IReadOnlyList<FATCaption> result, string provider, string backend, CaptionOperation operation)
+    {
+        _original = original; _result = result; Title = "AI変更案"; Width = 620; Height = 420; WindowStartupLocation = WindowStartupLocation.CenterOwner;
+        var panel = new StackPanel { Margin = new Thickness(16) }; Content = panel;
+        panel.Children.Add(new TextBlock { Text = $"使用AI: {provider}\n接続: {backend}\n操作: {(operation == CaptionOperation.Naturalize ? "自然にする" : "短くする")}", FontWeight = FontWeights.Bold });
+        panel.Children.Add(new TextBlock { Text = "変更前:", Margin = new Thickness(0, 12, 0, 2) });
+        panel.Children.Add(new TextBox { Text = string.Join(Environment.NewLine, original.Select(c => c.Text)), IsReadOnly = true, TextWrapping = TextWrapping.Wrap, AcceptsReturn = true, MinHeight = 60 });
+        panel.Children.Add(new TextBlock { Text = "変更後（編集して適用できます）:", Margin = new Thickness(0, 12, 0, 2) });
+        _editor.Text = string.Join(Environment.NewLine, result.Select(c => c.Text)); panel.Children.Add(_editor);
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, HorizontalAlignment = HorizontalAlignment.Right, Margin = new Thickness(0, 12, 0, 0) };
+        var apply = new Button { Content = "適用", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(0, 0, 8, 0) };
+        apply.Click += (_, _) => { var lines = _editor.Text.Replace("\r\n", "\n").Split('\n'); if (lines.Length != _result.Count) { MessageBox.Show(this, "字幕件数と同じ行数で編集してください。", Title, MessageBoxButton.OK, MessageBoxImage.Warning); return; } _result = _result.Select((caption, index) => caption with { Text = OutputValidator.ValidateText(lines[index]) }).ToArray(); DialogResult = true; };
+        var cancel = new Button { Content = "キャンセル", Padding = new Thickness(12, 6, 12, 6) }; cancel.Click += (_, _) => DialogResult = false;
+        buttons.Children.Add(apply); buttons.Children.Add(cancel); panel.Children.Add(buttons);
+    }
+}
+
+public sealed class ModelManagerWindow : Window
+{
+    private sealed record GemmaCard(string Id, string Name, string Source, double DiskGb, int RamGb, int VramGb);
+    private static readonly GemmaCard[] GemmaModels =
+    [
+        new("gemma-4-e2b-it", "Gemma 4 E2B", "google/gemma-4-E2B-it", 10.3, 16, 12),
+        new("gemma-4-e4b-it", "Gemma 4 E4B", "google/gemma-4-E4B-it", 18, 24, 16),
+        new("gemma-4-12b-it", "Gemma 4 12B", "google/gemma-4-12B-it", 28, 40, 24),
+        new("gemma-4-26b-a4b-it", "Gemma 4 26B A4B", "google/gemma-4-26B-A4B-it", 55, 72, 48)
+    ];
+    private readonly string _runtime;
+    private readonly PersistentPythonWorker _engine;
+    private readonly TextBlock _state = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
+    private readonly ProgressBar _progress = new() { Minimum = 0, Maximum = 100, Height = 18, Visibility = Visibility.Collapsed };
+    private readonly Button _download = new() { Content = "Download model", Padding = new Thickness(12, 6, 12, 6) };
+    private readonly Button _load = new() { Content = "Load model", Padding = new Thickness(12, 6, 12, 6), IsEnabled = false };
+    private readonly ComboBox _gemmaModel = new() { Width = 220, Margin = new Thickness(8, 0, 0, 0) };
+    private readonly TextBlock _gemmaDescription = new() { TextWrapping = TextWrapping.Wrap };
+    private readonly CodexCliBackend _codex;
+    private readonly CodexAppServerBackend _appServer;
+    private readonly ClaudeCodeCliBackend _claude;
+    private readonly ComboBox _codexBackend = new() { Width = 150, Margin = new Thickness(8, 0, 0, 0) };
+    private readonly TextBlock _codexState = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
+    private readonly TextBlock _claudeState = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
+    public ModelManagerWindow(string appBase, PersistentPythonWorker engine, CodexCliBackend codex, CodexAppServerBackend appServer, ClaudeCodeCliBackend claude)
+    {
+        _runtime = FindRuntime(appBase); _engine = engine; _codex = codex; _appServer = appServer; _claude = claude; Title = "AI / 音声モデル管理"; Width = 640; Height = 730; MinHeight = 520;
+        var panel = new StackPanel { Margin = new Thickness(16) };
+        Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        panel.Children.Add(new TextBlock { Text = "音声認識", FontSize = 18 });
+        panel.Children.Add(new TextBlock { Text = "OpenAI Whisper をベースにした音声認識\nBackend: faster-whisper\n状態: 利用可能（通常は「自動」を推奨）", TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(new Separator { Margin = new Thickness(0, 12, 0, 8) });
+        panel.Children.Add(new TextBlock { Text = "ローカル生成AI（Gemma 4）", FontSize = 18 });
+        var modelRow = new StackPanel { Orientation = Orientation.Horizontal }; modelRow.Children.Add(new TextBlock { Text = "モデル:", VerticalAlignment = VerticalAlignment.Center });
+        foreach (var model in GemmaModels) _gemmaModel.Items.Add(new ComboBoxItem { Content = model.Name, Tag = model.Id });
+        _gemmaModel.SelectedIndex = 0; modelRow.Children.Add(_gemmaModel); panel.Children.Add(modelRow);
+        panel.Children.Add(_gemmaDescription);
+        _gemmaModel.SelectionChanged += async (_, _) => { UpdateGemmaDescription(); await RefreshAsync(); };
+        UpdateGemmaDescription();
+        panel.Children.Add(_state); panel.Children.Add(_progress);
+        var actions = new StackPanel { Orientation = Orientation.Horizontal };
+        _download.Content = "モデルをダウンロード"; _load.Content = "モデルを読み込む";
+        _download.Click += async (_, _) => await DownloadAsync(); actions.Children.Add(_download);
+        _load.Click += async (_, _) => await LoadAsync(); actions.Children.Add(_load); panel.Children.Add(actions);
+        var refresh = new Button { Content = "確認 / 更新", Margin = new Thickness(0, 8, 0, 0), Padding = new Thickness(12, 6, 12, 6) }; refresh.Click += async (_, _) => await ValidateAsync(); panel.Children.Add(refresh);
+        panel.Children.Add(new Separator { Margin = new Thickness(0, 16, 0, 8) });
+        panel.Children.Add(new TextBlock { Text = "OpenAI Codex", FontSize = 18 });
+        panel.Children.Add(new TextBlock { Text = "Codex App Server は、Codex CLI の公式JSON-RPC接続です。Codex GUIそのものは自動操作しません。字幕本文だけを送信し、結果は必ず確認・編集してから適用します。", TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(_codexState);
+        var backendRow = new StackPanel { Orientation = Orientation.Horizontal }; backendRow.Children.Add(new TextBlock { Text = "接続方式:", VerticalAlignment = VerticalAlignment.Center });
+        _codexBackend.Items.Add(new ComboBoxItem { Content = "自動（接続済みApp Server優先）", Tag = "auto" });
+        _codexBackend.Items.Add(new ComboBoxItem { Content = "Codex App Server", Tag = "appserver" });
+        _codexBackend.Items.Add(new ComboBoxItem { Content = "Codex CLI", Tag = "cli" });
+        _codexBackend.SelectedIndex = 0; backendRow.Children.Add(_codexBackend); panel.Children.Add(backendRow);
+        var chooseCli = new Button { Content = "Codex CLIを参照...", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(0, 0, 0, 8) };
+        chooseCli.Click += async (_, _) => await ChooseCodexCliAsync();
+        panel.Children.Add(chooseCli);
+        var codexActions = new StackPanel { Orientation = Orientation.Horizontal };
+        var connectCodex = new Button { Content = "接続する", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(0, 0, 8, 0) };
+        connectCodex.Click += async (_, _) => await ConnectCodexAsync();
+        var checkCodex = new Button { Content = "接続確認", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(0, 0, 8, 0) }; checkCodex.Click += async (_, _) => await RefreshCodexAsync();
+        var openCodex = new Button { Content = "Codexを開く", Padding = new Thickness(12, 6, 12, 6) }; openCodex.Click += async (_, _) => { try { var status = await _codex.GetStatusAsync(CancellationToken.None); CodexCliBackend.OpenGui(status); } catch (FatException error) { MessageBox.Show(this, error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Information); } catch (Exception error) { MessageBox.Show(this, "Codex GUIを起動できませんでした。\n" + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Error); } };
+        var disconnectCodex = new Button { Content = "接続解除", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(8, 0, 0, 0) }; disconnectCodex.Click += async (_, _) => { await _appServer.DisconnectAsync(CancellationToken.None); await RefreshCodexAsync(); };
+        codexActions.Children.Add(connectCodex); codexActions.Children.Add(checkCodex); codexActions.Children.Add(openCodex); codexActions.Children.Add(disconnectCodex); panel.Children.Add(codexActions);
+        panel.Children.Add(new Separator { Margin = new Thickness(0, 16, 0, 8) });
+        panel.Children.Add(new TextBlock { Text = "Anthropic Claude Code", FontSize = 18 });
+        panel.Children.Add(new TextBlock { Text = "Claude Code CLI を使う外部AIです。字幕本文だけを専用の空作業領域から送信し、結果は必ず確認・編集してから適用します。認証情報はFATに保存しません。", TextWrapping = TextWrapping.Wrap });
+        panel.Children.Add(_claudeState);
+        var claudeActions = new StackPanel { Orientation = Orientation.Horizontal };
+        var checkClaude = new Button { Content = "接続確認", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(0, 0, 8, 0) }; checkClaude.Click += async (_, _) => await RefreshClaudeAsync();
+        var chooseClaude = new Button { Content = "Claude CLIを参照...", Padding = new Thickness(12, 6, 12, 6) }; chooseClaude.Click += async (_, _) => await ChooseClaudeCliAsync();
+        claudeActions.Children.Add(checkClaude); claudeActions.Children.Add(chooseClaude); panel.Children.Add(claudeActions);
+    }
+    public async Task RefreshAsync()
+    {
+        try
+        {
+            var response = await RunModelCommandAsync("model.status", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}");
+            using var document = JsonDocument.Parse(response); var payload = document.RootElement.GetProperty("payload");
+            var valid = payload.GetProperty("valid").GetBoolean(); var state = payload.GetProperty("state").GetString(); var path = payload.GetProperty("local_path").GetString();
+            var compatibility = payload.GetProperty("compatibility"); var recommendation = compatibility.GetProperty("recommendation").GetString(); var reason = compatibility.GetProperty("reason").GetString();
+            _state.Text = valid ? $"状態: {state}\n保存先: {path}\nこのPC: {recommendation} ({reason})\nPython Engine: 接続済み" : $"状態: {state}\nモデルは未導入または不完全です。\nこのPC: {recommendation} ({reason})\n保存先: {path}\nPython Engine: 接続済み";
+            _download.IsEnabled = !valid; _load.IsEnabled = valid;
+        }
+        catch (Exception error) { ShowRefreshFailure(error); }
+        await RefreshCodexAsync();
+        await RefreshClaudeAsync();
+    }
+    public void ShowRefreshFailure(Exception error)
+    {
+        _state.Text = "状態: Python Engineを確認できませんでした。\nGemma機能は使用できませんが、AIなし・Codexの管理は継続できます。\n詳細: " + error.Message;
+        _download.IsEnabled = _load.IsEnabled = false;
+    }
+    private async Task RefreshCodexAsync()
+    {
+        try
+        {
+            var status = await _codex.GetStatusAsync(CancellationToken.None);
+            var appServer = await _appServer.GetStatusAsync(CancellationToken.None);
+            _codexState.Text = $"Codex GUI: {(status.GuiDetected ? "利用可能（手動利用のみ）" : "未検出")}\nFAT → Codex App Server: {_appServer.ConnectionState}\nFAT → Codex CLI: {(status.CliDetected ? (status.CliRunnable ? "使用可能" : "検出済み（実行不可）") : "未検出")}\n詳細: {appServer.Detail}";
+        }
+        catch (Exception error) { _codexState.Text = "Codex状態: 確認失敗\n詳細: " + error.Message; }
+    }
+    private async Task RefreshClaudeAsync()
+    {
+        try { var status = await _claude.GetStatusAsync(CancellationToken.None); _claudeState.Text = $"Claude Code CLI: {(status.IsAvailable ? "使用可能" : status.Detected ? "検出済み（実行不可・認証またはCLIを確認）" : "未インストール")}" + "\n詳細: " + status.Detail; }
+        catch (Exception error) { _claudeState.Text = "Claude Code状態: 確認失敗\n詳細: " + error.Message; }
+    }
+    private async Task ChooseClaudeCliAsync()
+    {
+        var dialog = new OpenFileDialog { Filter = "Claude Code CLI|claude.exe;claude.cmd|実行ファイル|*.exe;*.cmd|すべてのファイル|*.*", Title = "Claude Code CLI実行ファイルを選択" };
+        if (dialog.ShowDialog(this) != true) return;
+        _claude.ConfigureExecutablePath(dialog.FileName);
+        var status = await _claude.GetStatusAsync(CancellationToken.None);
+        if (!status.IsAvailable) { _claude.ConfigureExecutablePath(null); MessageBox.Show(this, "選択したファイルは実行可能なClaude Code CLIとして確認できませんでした。\n\n" + status.Detail, Title, MessageBoxButton.OK, MessageBoxImage.Warning); return; }
+        var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
+        var current = await AiSelectionSettingsStore.LoadAsync(path, CancellationToken.None);
+        await AiSelectionSettingsStore.SaveAsync(path, current with { ClaudeCliPath = dialog.FileName }, CancellationToken.None);
+        await RefreshClaudeAsync();
+    }
+    private async Task ConnectCodexAsync()
+    {
+        var confirmation = MessageBox.Show(this, "OpenAI Codexとの連携\n\n選択した字幕テキストだけが、AI処理時にOpenAIサービスへ送信される場合があります。動画・AviUtl2プロジェクト・認証情報は送信しません。\n\nAI結果は自動確定せず、必ず確認・編集してから適用します。\n\n連携しますか？", Title, MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        if (confirmation != MessageBoxResult.OK) return;
+        var mode = (string)((ComboBoxItem)_codexBackend.SelectedItem).Tag;
+        try
+        {
+            if (mode is "appserver" or "auto")
+            {
+                await _appServer.ConnectAsync(CancellationToken.None);
+                MessageBox.Show(this, "Codex App Serverへ接続しました。\n\nメイン画面でAIを「OpenAI Codex」、Codex接続を「Codex App Server」または「自動」にして、字幕を選択して実行できます。", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            else
+            {
+                var status = await _codex.GetStatusAsync(CancellationToken.None);
+                if (!status.IsAvailable) throw new FatException("CODEX_CLI_UNAVAILABLE", status.Detail);
+                MessageBox.Show(this, "Codex CLI を利用できます。メイン画面でAIを「OpenAI Codex」にして、字幕を選択して実行してください。", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+        }
+        catch (FatException error) { MessageBox.Show(this, $"Codexへ接続できませんでした。\n\n{error.Code}: {error.Message}\n\nCodex GUIの有無だけではApp Serverは実行できません。公式Codex CLIが実行可能で、サインイン済みである必要があります。", Title, MessageBoxButton.OK, MessageBoxImage.Warning); }
+        catch (Exception error) { MessageBox.Show(this, "Codexへ接続できませんでした。\n" + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Error); }
+        await RefreshCodexAsync();
+    }
+    private async Task ChooseCodexCliAsync()
+    {
+        var dialog = new OpenFileDialog { Filter = "Codex CLI|codex.exe;codex.cmd|実行ファイル|*.exe;*.cmd|すべてのファイル|*.*", Title = "Codex CLI実行ファイルを選択" };
+        if (dialog.ShowDialog(this) != true) return;
+        _codex.ConfigureExecutablePath(dialog.FileName);
+        var status = await _codex.GetStatusAsync(CancellationToken.None);
+        if (!status.IsAvailable)
+        {
+            _codex.ConfigureExecutablePath(null);
+            MessageBox.Show(this, "選択したファイルは実行可能なCodex CLIとして確認できませんでした。\n\n" + status.Detail, Title, MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
+        var current = await AiSelectionSettingsStore.LoadAsync(path, CancellationToken.None);
+        await AiSelectionSettingsStore.SaveAsync(path, current with { CodexCliPath = dialog.FileName }, CancellationToken.None);
+        _appServer.ConfigureExecutablePath(dialog.FileName);
+        await RefreshCodexAsync();
+    }
+    private GemmaCard SelectedGemma => GemmaModels.First(item => item.Id == (string)((ComboBoxItem)_gemmaModel.SelectedItem).Tag);
+    private void UpdateGemmaDescription() { var item = SelectedGemma; _gemmaDescription.Text = $"提供元: Google / Instruction Tuned\nモデルID: {item.Source}\n概算サイズ: {item.DiskGb:0.#} GB\n推奨RAM: {item.RamGb} GB / 推奨VRAM: {item.VramGb} GB\n利用条件: https://huggingface.co/{item.Source}"; }
+    private async Task ValidateAsync() { _state.Text = "状態: 確認中..."; _state.Text = "確認結果: " + await RunModelCommandAsync("model.validate", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}"); await RefreshAsync(); }
+    private async Task LoadAsync() { _state.Text = "状態: モデルを読み込み中..."; _state.Text = "読み込み結果: " + await RunModelCommandAsync("model.load", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}"); await RefreshAsync(); }
+    private Task<string> RunModelCommandAsync(string type, string payload, Action<string>? progress = null) => _engine.RequestAsync(_runtime, type, payload, progress);
+    private async Task DownloadAsync()
+    {
+        var item = SelectedGemma;
+        var confirmation = MessageBox.Show(this, $"{item.Name} をGoogle / Hugging Faceからダウンロードします。\n\nSource: {item.Source}\nDownload: approximately {item.DiskGb:0.#} GB\n保存先: runtime\\models\\{item.Id}\n\n利用条件を確認し、Hugging Faceで必要なアクセス承認を済ませてから続行してください。", Title, MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+        if (confirmation != MessageBoxResult.OK) return;
+        _download.IsEnabled = false; _progress.Visibility = Visibility.Visible; _state.Text = "Status: Downloading...";
+        try
+        {
+            await RunModelCommandAsync("model.download", $"{{\"model_id\":\"{item.Id}\",\"confirmed\":true}}", line =>
+            {
+                using var json = JsonDocument.Parse(line); var root = json.RootElement;
+                if (root.TryGetProperty("payload", out var payload) && payload.TryGetProperty("percent", out var percent))
+                {
+                    _progress.Value = percent.GetDouble();
+                    var downloaded = payload.TryGetProperty("downloaded_bytes", out var bytes) ? bytes.GetInt64() / 1_000_000_000d : 0;
+                    var total = payload.TryGetProperty("total_bytes", out var totalBytes) ? totalBytes.GetInt64() / 1_000_000_000d : item.DiskGb;
+                    _state.Text = $"Status: Downloading {percent.GetDouble():0.0}%\n{downloaded:0.0} GB / {total:0.0} GB";
+                }
+                else if (root.TryGetProperty("error", out var error) && error.ValueKind != JsonValueKind.Null) throw new InvalidOperationException(error.ToString());
+            });
+            await RefreshAsync();
+        }
+        catch (Exception error) { _state.Text = "Status: Error\n" + error.Message; }
+        finally { _progress.Visibility = Visibility.Collapsed; _download.IsEnabled = true; }
+    }
+    private static string FindRuntime(string appBase)
+    {
+        var installed = Path.Combine(appBase, "runtime");
+        if (HasPythonEngine(installed)) return installed;
+        for (var current = new DirectoryInfo(appBase); current is not null; current = current.Parent)
+        {
+            var candidate = Path.Combine(current.FullName, "runtime");
+            if (HasPythonEngine(candidate)) return candidate;
+        }
+        return installed;
+    }
+    private static bool HasPythonEngine(string runtime) =>
+        (File.Exists(Path.Combine(runtime, "python-runtime", "python.exe")) || File.Exists(Path.Combine(runtime, "python-env", "Scripts", "python.exe"))) &&
+        File.Exists(Path.Combine(runtime, "python", "fat_worker.py"));
+}
+
+public sealed class PersistentPythonWorker : IDisposable
+{
+    private readonly SemaphoreSlim _gate = new(1, 1);
+    private Process? _process;
+    private StreamReader? _reader;
+    private StreamWriter? _writer;
+    private Task<string>? _stderr;
+
+    public async Task<string> RequestAsync(string runtime, string type, string payload, Action<string>? progress = null)
+    {
+        await _gate.WaitAsync();
+        try
+        {
+            StartIfNeeded(runtime);
+            var id = Guid.NewGuid().ToString("N");
+            await _writer!.WriteLineAsync($"{{\"protocol\":\"fat-python\",\"version\":1,\"id\":\"{id}\",\"type\":\"{type}\",\"payload\":{payload}}}");
+            while (await _reader!.ReadLineAsync() is { } line)
+            {
+                // fat_worker.py owns stdout as UTF-8 JSON Lines.  A native
+                // dependency must never make an incidental diagnostic line
+                // crash the caption editor, so only accept complete messages.
+                JsonDocument json;
+                try { json = JsonDocument.Parse(line); }
+                catch (JsonException) { continue; }
+                using (json)
+                {
+                var root = json.RootElement;
+                if (!root.TryGetProperty("id", out var responseId) || responseId.GetString() != id) continue;
+                var responseType = root.GetProperty("type").GetString();
+                if (responseType == "progress") { progress?.Invoke(line); continue; }
+                if (responseType is "result" or "error") return line;
+                }
+            }
+            var error = _stderr is null ? "" : await _stderr;
+            Reset();
+            throw new InvalidOperationException("FAT_PYTHON_DISCONNECTED: " + error);
+        }
+        catch
+        {
+            if (_process?.HasExited == true) Reset();
+            throw;
+        }
+        finally { _gate.Release(); }
+    }
+
+    private void StartIfNeeded(string runtime)
+    {
+        if (_process is { HasExited: false }) return;
+        Reset();
+        var portablePython = Path.Combine(runtime, "python-runtime", "python.exe");
+        var python = File.Exists(portablePython) ? portablePython : Path.Combine(runtime, "python-env", "Scripts", "python.exe");
+        var worker = FindEngine(runtime);
+        if (!File.Exists(python) || !File.Exists(worker)) throw new FatException("FAT_RUNTIME_MISSING", "Python FAT Engine runtime was not found.");
+        var start = new ProcessStartInfo(python, $"\"{worker}\"")
+        {
+            WorkingDirectory = runtime,
+            UseShellExecute = false,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardInputEncoding = new UTF8Encoding(false),
+            StandardOutputEncoding = new UTF8Encoding(false),
+            StandardErrorEncoding = new UTF8Encoding(false),
+            CreateNoWindow = true
+        };
+        start.Environment["PYTHONUTF8"] = "1";
+        start.Environment["PYTHONIOENCODING"] = "utf-8";
+        _process = Process.Start(start) ?? throw new FatException("FAT_PYTHON_START_FAILED", "Python FAT Engine could not be started.");
+        _writer = _process.StandardInput; _writer.AutoFlush = true; _reader = _process.StandardOutput; _stderr = _process.StandardError.ReadToEndAsync();
+    }
+
+    private static string FindEngine(string runtime)
+    {
+        var installed = Path.Combine(runtime, "python", "fat_worker.py");
+        // In a development tree, use the current source before the copied runtime.
+        // A packaged installation normally has no sibling python source and falls back below.
+        for (var current = new DirectoryInfo(runtime).Parent; current is not null; current = current.Parent)
+        {
+            var candidate = Path.Combine(current.FullName, "python", "fat_worker.py");
+            if (File.Exists(candidate)) return candidate;
+        }
+        return installed;
+    }
+
+    private void Reset()
+    {
+        _writer?.Dispose(); _reader?.Dispose();
+        if (_process is { HasExited: false }) { try { _process.Kill(entireProcessTree: true); } catch { } }
+        _process?.Dispose(); _process = null; _writer = null; _reader = null; _stderr = null;
+    }
+    public void Dispose() { Reset(); _gate.Dispose(); }
+}
+
+public static class ButtonExtensions { public static Button With(this Button button, RoutedEventHandler handler) { button.Click += handler; return button; } }
+public sealed class App : Application
+{
+    [STAThread]
+    public static void Main()
+    {
+        var app = new App { ShutdownMode = ShutdownMode.OnMainWindowClose };
+        var mainWindow = new FatWindow();
+        app.MainWindow = mainWindow;
+        app.Run(mainWindow);
+    }
+}

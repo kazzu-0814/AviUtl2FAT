@@ -1,0 +1,31 @@
+# Build and distribution artifacts
+[Bb]in/
+[Oo]bj/
+plugin/target/
+dist/
+backup/
+*.user
+*.suo
+*.pdb
+
+# FAT runtime: source Python code is published, generated/runtime assets are not
+runtime/python-env/
+runtime/python-env.incomplete-*/
+runtime/python-runtime/
+runtime/ffmpeg/*.exe
+runtime/models/
+runtime/sessions/
+runtime/*.log
+runtime/*.err.log
+
+# Python and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# User data, secrets, and local IDE configuration
+config/*.local.json
+*.token
+.env
+.vscode/
+.idea/

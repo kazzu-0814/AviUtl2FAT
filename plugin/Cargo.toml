@@ -1,0 +1,12 @@
+[package]
+name = "aviutl2-fat-plugin"
+version = "1.0.0"
+edition = "2024"
+license = "MIT"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+aviutl2 = { version = "0.38.2", default-features = false, features = ["generic", "filter"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader"] }

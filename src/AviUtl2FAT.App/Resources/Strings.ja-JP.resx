@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<root>
+  <data name="AppTitle" xml:space="preserve"><value>AviUtl2 FAT</value></data>
+  <data name="ModelManager" xml:space="preserve"><value>モデル管理</value></data>
+  <data name="RecognitionLanguage" xml:space="preserve"><value>音声認識言語</value></data>
+  <data name="OutputLanguage" xml:space="preserve"><value>字幕出力言語</value></data>
+  <data name="NotInstalled" xml:space="preserve"><value>未インストール</value></data>
+</root>
