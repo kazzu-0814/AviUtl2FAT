@@ -1,6 +1,7 @@
 param(
     [switch]$BuildPortablePython,
     [switch]$BuildInstaller,
+    [switch]$SkipPortableArchive,
     [switch]$Clean,
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version = '1.0.2'
@@ -55,7 +56,9 @@ $required = @('AviUtl2FAT.aux2', 'FAT\AviUtl2FAT.App.exe', 'FAT\AviUtl2FAT.Worke
 if ($BuildPortablePython) { $required += 'FAT\runtime\python-runtime\python.exe' }
 foreach ($relative in $required) { if (-not (Test-Path -LiteralPath (Join-Path $payload $relative))) { throw "Package validation failed: $relative" } }
 
-Compress-Archive -Path (Join-Path $dist '*') -DestinationPath (Join-Path $root "dist\AviUtl2FAT-$version-x64-portable.zip") -Force
+if (-not $SkipPortableArchive) {
+    Compress-Archive -Path (Join-Path $dist '*') -DestinationPath (Join-Path $root "dist\AviUtl2FAT-$version-x64-portable.zip") -Force
+}
 if ($BuildInstaller) {
     $iscc = @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe', (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if (-not $iscc) { throw 'Inno Setup 6 is required to build the installer. Install it, then run this command again.' }
