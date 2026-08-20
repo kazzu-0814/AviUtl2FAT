@@ -14,6 +14,22 @@ from att_engine.recognizer import FasterWhisperRecognizer, RecognitionOptions, c
 from att_engine.speech_pipeline import TranscriptPostProcessor, build_initial_prompt, select_profile, warning_for
 
 
+class FakeWord:
+    def __init__(self, start, end):
+        self.start = start
+        self.end = end
+
+
+class FakeSegment:
+    def __init__(self, start, end, text, words):
+        self.start = start
+        self.end = end
+        self.text = text
+        self.words = words
+        self.avg_logprob = -0.2
+        self.no_speech_prob = 0.0
+
+
 class EngineTests(unittest.TestCase):
     def test_timestamp_and_frame(self):
         self.assertEqual("00:00:02.840", timestamp(2.84))
@@ -75,6 +91,15 @@ class EngineTests(unittest.TestCase):
             with self.assertRaises(AttError) as error:
                 FasterWhisperRecognizer(options).recognize(root / "audio.wav")
             self.assertEqual("FAT_SPEECH_MODEL_NOT_INSTALLED", error.exception.code)
+
+    def test_word_timestamps_preserve_silent_gap_when_segment_boundaries_touch(self):
+        first = FakeSegment(0.0, 7.0, "こんにちは", [FakeWord(0.2, 1.8)])
+        second = FakeSegment(7.0, 9.0, "次です", [FakeWord(7.1, 8.7)])
+        start1, end1 = FasterWhisperRecognizer._word_boundary(first)
+        start2, end2 = FasterWhisperRecognizer._word_boundary(second)
+        self.assertEqual((0.2, 1.8), (start1, end1))
+        self.assertEqual((7.1, 8.7), (start2, end2))
+        self.assertGreater(start2 - end1, 5.0)
 
     def test_post_processor_filters_silence_duplicates_and_repairs_time(self):
         values = TranscriptPostProcessor().process([

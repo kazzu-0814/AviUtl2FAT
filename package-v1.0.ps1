@@ -45,9 +45,9 @@ New-Item -ItemType Directory -Force -Path $app | Out-Null
 
 # The App includes its isolated Worker. self-contained avoids a .NET Desktop
 # Runtime prerequisite on the recipient's computer.
-& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.App\AviUtl2FAT.App.csproj') -c Release -r win-x64 --self-contained true -p:Version=$version -p:BuildProjectReferences=false -p:SkipFatWorkerDeployment=true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o $app
+& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.App\AviUtl2FAT.App.csproj') -c Release -r win-x64 --self-contained true -p:Version=$version -p:AssemblyVersion="$version.0" -p:FileVersion="$version.0" -p:InformationalVersion=$version -p:BuildProjectReferences=false -p:SkipFatWorkerDeployment=true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o $app
 if ($LASTEXITCODE -ne 0) { throw 'Self-contained App publish failed.' }
-& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.Worker\AviUtl2FAT.Worker.csproj') -c Release -r win-x64 --self-contained true -p:DebugType=None -p:DebugSymbols=false -o $app
+& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.Worker\AviUtl2FAT.Worker.csproj') -c Release -r win-x64 --self-contained true -p:Version=$version -p:AssemblyVersion="$version.0" -p:FileVersion="$version.0" -p:InformationalVersion=$version -p:DebugType=None -p:DebugSymbols=false -o $app
 if ($LASTEXITCODE -ne 0) { throw 'Self-contained Worker publish failed.' }
 & $cargo build --manifest-path (Join-Path $root 'plugin\Cargo.toml') --release
 if ($LASTEXITCODE -ne 0) { throw 'Rust plugin release build failed.' }

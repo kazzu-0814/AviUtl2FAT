@@ -47,6 +47,30 @@ class FasterWhisperRecognizer:
     def __init__(self, options: RecognitionOptions) -> None:
         self.options = options
 
+    @staticmethod
+    def _word_boundary(segment: object) -> tuple[float | None, float | None]:
+        words = getattr(segment, "words", None)
+        if not words:
+            return None, None
+        starts: list[float] = []
+        ends: list[float] = []
+        for word in words:
+            start = getattr(word, "start", None)
+            end = getattr(word, "end", None)
+            if start is None or end is None:
+                continue
+            try:
+                start_value = float(start)
+                end_value = float(end)
+            except (TypeError, ValueError):
+                continue
+            if end_value > start_value:
+                starts.append(start_value)
+                ends.append(end_value)
+        if not starts or not ends:
+            return None, None
+        return min(starts), max(ends)
+
     def recognize(self, audio_path: Path, total_seconds: float = 0) -> tuple[Iterator[dict[str, object]], str | None]:
         if self.options.model not in MODEL_REPOS:
             raise AttError("FAT_SPEECH_MODEL_INVALID", f"未対応の音声認識モデルです: {self.options.model}")
@@ -112,11 +136,22 @@ class FasterWhisperRecognizer:
                 for index, segment in enumerate(raw_segments, start=1):
                     throw_if_cancelled(self.options.cancel_file)
                     original = segment.text.strip(); text = clean_text(original, self.options.remove_spaces, self.options.remove_fillers)
+                    word_start, word_end = self._word_boundary(segment)
+                    start = float(segment.start)
+                    end = float(segment.end)
+                    if word_start is not None and word_end is not None:
+                        # faster-whisper segment boundaries can be broad and
+                        # sometimes touch the next segment, which makes FAT
+                        # appear to erase silent gaps.  When word timestamps are
+                        # available, use the actual first/last spoken word as
+                        # the subtitle timing authority.
+                        start = max(0.0, word_start)
+                        end = max(start + 0.01, word_end)
                     average_logprob = getattr(segment, "avg_logprob", None)
                     no_speech = getattr(segment, "no_speech_prob", None)
                     # avg_logprob is negative; map it conservatively to 0..1 for UI warnings.
                     confidence = None if average_logprob is None else max(0.0, min(1.0, (float(average_logprob) + 2.0) / 2.0))
-                    item = {"id": index, "start": float(segment.start), "end": float(segment.end), "original_text": original, "text": text, "enabled": True,
+                    item = {"id": index, "start": start, "end": end, "segment_start": float(segment.start), "segment_end": float(segment.end), "original_text": original, "text": text, "enabled": True,
                             "avg_logprob": average_logprob, "no_speech_probability": no_speech, "confidence": confidence}
                     emit("segment", **item)
                     processed = max(0.0, float(segment.end))
