@@ -16,13 +16,30 @@ $dist = Join-Path $root "dist\AviUtl2FAT-$version-x64"
 $payload = Join-Path $dist 'Plugin\AviUtl2FAT'
 $app = Join-Path $payload 'FAT'
 
+function Remove-PackageOutput([string]$Path) {
+    # robocopy handles long paths more reliably than Copy-Item/Remove-Item.
+    # Mirror an explicitly-created empty folder first, then remove the empty
+    # output directory. This function is reached only with the explicit -Clean
+    # switch, so normal packaging never deletes an existing build.
+    $empty = Join-Path ([System.IO.Path]::GetTempPath()) ("AviUtl2FAT-empty-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Force -Path $empty | Out-Null
+    try {
+        & robocopy $empty $Path /MIR /R:2 /W:1 /NFL /NDL /NJH /NJS | Out-Null
+        if ($LASTEXITCODE -gt 7) { throw "Failed to clean package output: $Path" }
+    }
+    finally {
+        Remove-Item -LiteralPath $empty -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    Remove-Item -LiteralPath $Path -Recurse -Force
+}
+
 if (-not (Test-Path -LiteralPath $dotnet)) { throw ".NET SDK was not found: $dotnet" }
 if (-not (Test-Path -LiteralPath $cargo)) { throw "Rust cargo.exe was not found: $cargo" }
 if (Test-Path -LiteralPath $dist) {
     if (-not $Clean) {
         throw "The package output already exists and was not changed: $dist`nChoose a new -Version (recommended), or explicitly pass -Clean to rebuild that exact version."
     }
-    Remove-Item -LiteralPath $dist -Recurse -Force
+    Remove-PackageOutput $dist
 }
 New-Item -ItemType Directory -Force -Path $app | Out-Null
 
