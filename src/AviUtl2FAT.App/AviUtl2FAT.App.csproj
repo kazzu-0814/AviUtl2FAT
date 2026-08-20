@@ -16,7 +16,7 @@
     worker launch set beside the App so Debug builds and published layouts behave
     identically; copying only the .exe would omit its runtimeconfig/deps files.
   -->
-  <Target Name="CopyFatWorkerToAppOutput" AfterTargets="Build">
+  <Target Name="CopyFatWorkerToAppOutput" AfterTargets="Build" Condition="'$(SkipFatWorkerDeployment)' != 'true'">
     <ItemGroup>
       <FatWorkerDeploymentFiles Include="$(MSBuildThisFileDirectory)..\AviUtl2FAT.Worker\bin\$(Configuration)\net8.0\AviUtl2FAT.Worker.exe" />
       <FatWorkerDeploymentFiles Include="$(MSBuildThisFileDirectory)..\AviUtl2FAT.Worker\bin\$(Configuration)\net8.0\AviUtl2FAT.Worker.dll" />

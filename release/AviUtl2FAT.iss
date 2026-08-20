@@ -59,10 +59,21 @@ begin
   end;
 end;
 
-function GetFatPluginDirectory(Param: String): String;
+function GetRequestedPluginDirectory: String;
 begin
-  Result := AddBackslash(PluginPage.Values[0]) + 'AviUtl2FAT';
+  Result := ExpandConstant('{param:PluginDir|}');
+  if Result = '' then
+    Result := ExpandConstant('{param:PLUGIN_DIR|}');
 end;
 
-[UninstallDelete]
-Type: filesandordirs; Name: "{code:GetFatPluginDirectory}"
+function GetFatPluginDirectory(Param: String): String;
+begin
+  if GetRequestedPluginDirectory <> '' then
+    Result := AddBackslash(GetRequestedPluginDirectory) + 'AviUtl2FAT'
+  else if PluginPage <> nil then
+    Result := AddBackslash(PluginPage.Values[0]) + 'AviUtl2FAT'
+  else if DirExists(ExpandConstant('{commonappdata}\aviutl2\Plugin')) then
+    Result := ExpandConstant('{commonappdata}\aviutl2\Plugin\AviUtl2FAT')
+  else
+    Result := ExpandConstant('{userappdata}\aviutl2\Plugin\AviUtl2FAT');
+end;
