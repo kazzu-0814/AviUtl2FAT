@@ -44,13 +44,14 @@ public interface IVideoPreviewBackend
     TimeSpan Position { get; }
     TimeSpan Duration { get; }
     double Volume { get; set; }
-    void Open(string path);
+    Task OpenAsync(string path, CancellationToken cancellationToken = default);
     void Play();
     void Pause();
     void Stop();
     void Seek(TimeSpan position);
     void Close();
     Task RefreshFrameAsync(CancellationToken cancellationToken = default);
+    void CancelFrameRequest();
     string DisplayMode { get; }
     double AspectRatio { get; }
 }
@@ -69,18 +70,30 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
     private TimeSpan _position;
     private TimeSpan _duration;
     private string? _input;
-    private int _rendering;
+    private readonly object _frameSync = new();
+    private CancellationTokenSource? _frameCancellation;
+    private readonly Dictionary<long, BitmapSource> _frameCache = new();
+    private long _lastRenderedFrameBucket = -1;
+    private string? _cachedInput;
     private readonly System.Windows.Media.MediaPlayer _audioPlayer = new();
     private CancellationTokenSource? _audioCancellation;
     private string? _temporaryAudioPath;
     private int _audioGeneration;
     private double _volume = 0.7;
+    private const int TargetFramesPerSecond = 10;
+    private const int MaximumCachedFrames = 24;
+    private const int AudioChunkSeconds = 30;
 
     public FfmpegFramePreviewBackend(Image image, string runtimeRoot)
     {
         _image = image;
         _ffmpegPath = Path.Combine(runtimeRoot, "ffmpeg", "ffmpeg.exe");
         _ffprobePath = Path.Combine(runtimeRoot, "ffmpeg", "ffprobe.exe");
+        _audioPlayer.MediaEnded += (_, _) =>
+        {
+            if (_status == PreviewPlayerStatus.Playing && Position < _duration)
+                StartAudioFromCurrentPosition();
+        };
     }
 
     public PreviewPlayerStatus Status => _status;
@@ -94,7 +107,7 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
     public string DisplayMode => "FFmpeg互換プレビュー（音声対応）";
     public double AspectRatio { get; private set; } = 16d / 9d;
 
-    public void Open(string path)
+    public async Task OpenAsync(string path, CancellationToken cancellationToken = default)
     {
         if (!File.Exists(_ffmpegPath) || !File.Exists(_ffprobePath))
             throw new FatException("FAT_FFMPEG_MISSING", "プレビュー用の FFmpeg / ffprobe が見つかりません。FATを再インストールしてください。");
@@ -103,7 +116,7 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
         Close();
         _status = PreviewPlayerStatus.Opening;
         _input = path;
-        ReadMetadata(path);
+        await ReadMetadataAsync(path, cancellationToken);
         _position = TimeSpan.Zero;
         _status = PreviewPlayerStatus.Stopped;
     }
@@ -153,6 +166,10 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
         _duration = TimeSpan.Zero;
         _input = null;
         _image.Source = null;
+        CancelFrameRequest();
+        _frameCache.Clear();
+        _cachedInput = null;
+        _lastRenderedFrameBucket = -1;
         ++_audioGeneration;
         CancelAudioDecode();
         _audioPlayer.Close();
@@ -162,7 +179,16 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
 
     public async Task RefreshFrameAsync(CancellationToken cancellationToken = default)
     {
-        if (_input is null || _status == PreviewPlayerStatus.NotLoaded || Interlocked.Exchange(ref _rendering, 1) != 0) return;
+        if (_input is null || _status == PreviewPlayerStatus.NotLoaded) return;
+        CancellationTokenSource requestCancellation;
+        lock (_frameSync)
+        {
+            _frameCancellation?.Cancel();
+            _frameCancellation?.Dispose();
+            _frameCancellation = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+            requestCancellation = _frameCancellation;
+        }
+        var requestToken = requestCancellation.Token;
         try
         {
             var position = Position;
@@ -173,6 +199,18 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
                 _status = PreviewPlayerStatus.Stopped;
             }
 
+            var frameBucket = (long)Math.Floor(position.TotalSeconds * TargetFramesPerSecond);
+            if (string.Equals(_cachedInput, _input, StringComparison.Ordinal) && _frameCache.TryGetValue(frameBucket, out var cached))
+            {
+                _image.Source = cached;
+                _lastRenderedFrameBucket = frameBucket;
+                return;
+            }
+
+            // A request for the same time bucket adds no information.  This is
+            // common while the UI timer updates labels between preview frames.
+            if (_lastRenderedFrameBucket == frameBucket && string.Equals(_cachedInput, _input, StringComparison.Ordinal)) return;
+
             var start = new ProcessStartInfo(_ffmpegPath)
             {
                 UseShellExecute = false,
@@ -182,48 +220,75 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
             };
             start.ArgumentList.Add("-hide_banner");
             start.ArgumentList.Add("-loglevel"); start.ArgumentList.Add("error");
-            start.ArgumentList.Add("-ss"); start.ArgumentList.Add(Position.TotalSeconds.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
+            start.ArgumentList.Add("-ss"); start.ArgumentList.Add((frameBucket / (double)TargetFramesPerSecond).ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
             start.ArgumentList.Add("-i"); start.ArgumentList.Add(_input);
             start.ArgumentList.Add("-frames:v"); start.ArgumentList.Add("1");
-            start.ArgumentList.Add("-vf"); start.ArgumentList.Add("scale='min(1280,iw)':-2");
+            start.ArgumentList.Add("-vf"); start.ArgumentList.Add("scale='min(960,iw)':-2");
             start.ArgumentList.Add("-f"); start.ArgumentList.Add("image2pipe");
-            start.ArgumentList.Add("-vcodec"); start.ArgumentList.Add("png"); start.ArgumentList.Add("pipe:1");
+            start.ArgumentList.Add("-vcodec"); start.ArgumentList.Add("mjpeg"); start.ArgumentList.Add("-q:v"); start.ArgumentList.Add("5"); start.ArgumentList.Add("pipe:1");
             using var process = Process.Start(start) ?? throw new InvalidOperationException("FFmpegプレビューを起動できませんでした。");
-            await using var bytes = new MemoryStream();
-            var outputTask = process.StandardOutput.BaseStream.CopyToAsync(bytes, cancellationToken);
-            var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
-            await Task.WhenAll(outputTask, process.WaitForExitAsync(cancellationToken));
-            var error = await errorTask;
-            if (process.ExitCode != 0 || bytes.Length == 0)
-                throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "FFmpegからプレビュー画像を取得できませんでした。" : error.Trim());
-
-            bytes.Position = 0;
-            var bitmap = new BitmapImage();
-            bitmap.BeginInit(); bitmap.CacheOption = BitmapCacheOption.OnLoad; bitmap.StreamSource = bytes; bitmap.EndInit(); bitmap.Freeze();
-            _image.Source = bitmap;
+            using var registration = requestToken.Register(() => { try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { } });
+            var result = await Task.Run(async () =>
+            {
+                await using var bytes = new MemoryStream();
+                var outputTask = process.StandardOutput.BaseStream.CopyToAsync(bytes, requestToken);
+                var errorTask = process.StandardError.ReadToEndAsync(requestToken);
+                await Task.WhenAll(outputTask, process.WaitForExitAsync(requestToken));
+                var error = await errorTask;
+                if (process.ExitCode != 0 || bytes.Length == 0)
+                    throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "FFmpegからプレビュー画像を取得できませんでした。" : error.Trim());
+                bytes.Position = 0;
+                var bitmap = BitmapFrame.Create(bytes, BitmapCreateOptions.PreservePixelFormat, BitmapCacheOption.OnLoad);
+                bitmap.Freeze();
+                return bitmap;
+            }, requestToken);
+            requestToken.ThrowIfCancellationRequested();
+            _image.Source = result;
+            _cachedInput = _input;
+            _lastRenderedFrameBucket = frameBucket;
+            _frameCache[frameBucket] = result;
+            while (_frameCache.Count > MaximumCachedFrames) _frameCache.Remove(_frameCache.Keys.Min());
         }
-        finally { Interlocked.Exchange(ref _rendering, 0); }
+        catch (OperationCanceledException) { }
     }
 
-    private void ReadMetadata(string path)
+    public void CancelFrameRequest()
     {
-        var start = new ProcessStartInfo(_ffprobePath)
+        lock (_frameSync)
         {
-            UseShellExecute = false,
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            CreateNoWindow = true
-        };
-        start.ArgumentList.Add("-v"); start.ArgumentList.Add("error");
-        start.ArgumentList.Add("-select_streams"); start.ArgumentList.Add("v:0");
-        start.ArgumentList.Add("-show_entries"); start.ArgumentList.Add("format=duration:stream=width,height");
-        start.ArgumentList.Add("-of"); start.ArgumentList.Add("json"); start.ArgumentList.Add(path);
-        using var process = Process.Start(start) ?? throw new InvalidOperationException("ffprobeを起動できませんでした。");
-        var output = process.StandardOutput.ReadToEnd();
-        var error = process.StandardError.ReadToEnd();
-        if (!process.WaitForExit(10_000) || process.ExitCode != 0)
-            throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "動画情報を読み取れませんでした。" : error.Trim());
-        using var document = JsonDocument.Parse(output);
+            _frameCancellation?.Cancel();
+            _frameCancellation?.Dispose();
+            _frameCancellation = null;
+        }
+    }
+
+    private async Task ReadMetadataAsync(string path, CancellationToken cancellationToken)
+    {
+        var metadata = await Task.Run(async () =>
+        {
+            var start = new ProcessStartInfo(_ffprobePath)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            start.ArgumentList.Add("-v"); start.ArgumentList.Add("error");
+            start.ArgumentList.Add("-select_streams"); start.ArgumentList.Add("v:0");
+            start.ArgumentList.Add("-show_entries"); start.ArgumentList.Add("format=duration:stream=width,height");
+            start.ArgumentList.Add("-of"); start.ArgumentList.Add("json"); start.ArgumentList.Add(path);
+            using var process = Process.Start(start) ?? throw new InvalidOperationException("ffprobeを起動できませんでした。");
+            using var registration = cancellationToken.Register(() => { try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { } });
+            var outputTask = process.StandardOutput.ReadToEndAsync(cancellationToken);
+            var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            await process.WaitForExitAsync(cancellationToken);
+            var output = await outputTask;
+            var error = await errorTask;
+            if (process.ExitCode != 0)
+                throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "動画情報を読み取れませんでした。" : error.Trim());
+            return output;
+        }, cancellationToken);
+        using var document = JsonDocument.Parse(metadata);
         var root = document.RootElement;
         if (root.TryGetProperty("format", out var format) && format.TryGetProperty("duration", out var durationElement) &&
             double.TryParse(durationElement.GetString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var seconds))
@@ -266,7 +331,7 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
             start.ArgumentList.Add("-hide_banner"); start.ArgumentList.Add("-loglevel"); start.ArgumentList.Add("error"); start.ArgumentList.Add("-y");
             start.ArgumentList.Add("-ss"); start.ArgumentList.Add(position.TotalSeconds.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
             start.ArgumentList.Add("-i"); start.ArgumentList.Add(input);
-            start.ArgumentList.Add("-vn"); start.ArgumentList.Add("-ac"); start.ArgumentList.Add("2"); start.ArgumentList.Add("-ar"); start.ArgumentList.Add("48000");
+            start.ArgumentList.Add("-vn"); start.ArgumentList.Add("-t"); start.ArgumentList.Add(AudioChunkSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture)); start.ArgumentList.Add("-ac"); start.ArgumentList.Add("2"); start.ArgumentList.Add("-ar"); start.ArgumentList.Add("48000");
             start.ArgumentList.Add("-c:a"); start.ArgumentList.Add("pcm_s16le"); start.ArgumentList.Add(output);
             using var process = Process.Start(start) ?? throw new InvalidOperationException("FFmpeg音声デコーダーを起動できませんでした。");
             using var registration = cancellationToken.Register(() =>
@@ -346,7 +411,9 @@ public sealed class FatWindow : Window
     private readonly CheckBox _autoFollowCaptions = new() { Content = "字幕に追従", IsChecked = true, Margin = new Thickness(8, 0, 8, 0) };
     private readonly CheckBox _showPreviewOverlay = new() { Content = "字幕プレビュー", IsChecked = true, Margin = new Thickness(0, 0, 8, 0) };
     private readonly Slider _previewVolume = new() { Minimum = 0, Maximum = 1, Value = 0.7, Width = 90 };
-    private readonly DispatcherTimer _previewTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
+    // 10 Hz is sufficient for subtitle timing checks and deliberately decouples
+    // editor responsiveness from a source video's 30/60 fps.
+    private readonly DispatcherTimer _previewTimer = new() { Interval = TimeSpan.FromMilliseconds(100) };
     private readonly IVideoPreviewBackend _previewBackend;
     private DataGrid? _captionGrid;
     private CaptionRow? _editingCaption;
@@ -358,6 +425,7 @@ public sealed class FatWindow : Window
     private AviUtl2TextStyle _style = AviUtl2TextStyle.Default;
     private readonly string _aiSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
     private readonly string _previewSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "preview-settings.json");
+    private readonly string _shortcutSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "shortcut-settings.json");
     private string? _input;
     private bool _isRecognizing;
     private CancellationTokenSource? _recognitionCancellation;
@@ -369,7 +437,11 @@ public sealed class FatWindow : Window
     private bool _isSeekingWithSlider;
     private bool _isUpdatingCurrentSelection;
     private bool _isRefreshingPreviewFrame;
+    private CancellationTokenSource? _previewFrameRefreshCancellation;
+    private DateTimeOffset _lastPreviewFrameDispatch = DateTimeOffset.MinValue;
     private DateTimeOffset _suspendAutoFollowUntil = DateTimeOffset.MinValue;
+    private ShortcutSettings _shortcutSettings = ShortcutSettings.Default;
+    private ShortcutManager _shortcutManager = new();
 
     public FatWindow()
     {
@@ -517,9 +589,10 @@ public sealed class FatWindow : Window
         _codexBackend.SelectionChanged += async (_, _) => await SaveAiSettingsAsync();
         UpdateAiState();
         LoadPreviewSettings();
+        LoadShortcutSettings();
         ConfigurePreviewEvents();
         SelectNavigation("ホーム");
-        Closed += (_, _) => { SavePreviewSettings(); _previewTimer.Stop(); _previewBackend.Close(); _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
+        Closed += (_, _) => { SavePreviewSettings(); SaveShortcutSettings(); _previewTimer.Stop(); _previewBackend.Close(); _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
     }
 
     private Border CreatePreviewPanel()
@@ -582,20 +655,7 @@ public sealed class FatWindow : Window
         _autoFollowCaptions.Unchecked += (_, _) => SavePreviewSettings();
         _showPreviewOverlay.Checked += (_, _) => { SavePreviewSettings(); UpdatePreviewOverlay(); };
         _showPreviewOverlay.Unchecked += (_, _) => { SavePreviewSettings(); UpdatePreviewOverlay(); };
-        PreviewKeyDown += (_, args) =>
-        {
-            if (args.Key == Key.Space)
-            {
-                if (_previewBackend.Status == PreviewPlayerStatus.Playing) PausePreview(); else PlayPreview();
-                args.Handled = true;
-            }
-            else if (args.Key is Key.Left or Key.Right)
-            {
-                var direction = args.Key == Key.Right ? 1 : -1;
-                SeekRelative(Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) ? 5 * direction : direction);
-                args.Handled = true;
-            }
-        };
+        PreviewKeyDown += (_, args) => HandleShortcutKey(args);
     }
 
     private void LoadPreviewSettings()
@@ -625,17 +685,66 @@ public sealed class FatWindow : Window
         catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
     }
 
-    private void OpenPreviewMedia(string path)
+    private void LoadShortcutSettings()
+    {
+        _shortcutSettings = ShortcutSettingsStore.LoadAsync(_shortcutSettingsPath, CancellationToken.None).GetAwaiter().GetResult();
+        _shortcutManager = new ShortcutManager(_shortcutSettings);
+    }
+
+    private void SaveShortcutSettings()
+    {
+        try { ShortcutSettingsStore.SaveAsync(_shortcutSettingsPath, _shortcutSettings, CancellationToken.None).GetAwaiter().GetResult(); }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+    }
+
+    private void HandleShortcutKey(KeyEventArgs args)
+    {
+        // Never take keys away from caption editors, settings text boxes, or an
+        // IME composition.  This preserves ordinary Space and Japanese input.
+        if (IsTextInputFocused()) return;
+        var key = NormalizeKey(args);
+        var modifiers = Keyboard.Modifiers;
+        if (_shortcutManager.Matches(ShortcutAction.TogglePreviewPlayback, key,
+                modifiers.HasFlag(ModifierKeys.Control), modifiers.HasFlag(ModifierKeys.Shift), modifiers.HasFlag(ModifierKeys.Alt)))
+        {
+            if (_previewBackend.Status == PreviewPlayerStatus.Playing) PausePreview(); else PlayPreview();
+            args.Handled = true;
+        }
+    }
+
+    private static string NormalizeKey(KeyEventArgs args)
+    {
+        var key = args.Key == Key.System ? args.SystemKey : args.Key;
+        return key == Key.Space ? "Space" : key.ToString();
+    }
+
+    private static bool IsTextInputFocused()
+    {
+        if (Keyboard.FocusedElement is not DependencyObject current) return false;
+        while (current is not null)
+        {
+            if (current is TextBox or PasswordBox || current is ComboBox { IsEditable: true }) return true;
+            current = current switch
+            {
+                System.Windows.Media.Visual or System.Windows.Media.Media3D.Visual3D => System.Windows.Media.VisualTreeHelper.GetParent(current),
+                FrameworkContentElement content => content.Parent,
+                _ => LogicalTreeHelper.GetParent(current)
+            };
+        }
+        return false;
+    }
+
+    private async Task OpenPreviewMediaAsync(string path)
     {
         try
         {
             _previewBackend.Close();
-            _previewBackend.Open(path);
+            await _previewBackend.OpenAsync(path);
             _previewStatus.Text = "プレビュー: フレームを読み込み中";
             _previewFormat.Text = $"表示: {DescribeAspectRatio(_previewBackend.AspectRatio)}";
             _seekBar.Value = 0;
             UpdatePlaybackSync();
-            _ = RefreshPreviewFrameAsync();
+            _ = RefreshPreviewFrameAsync(force: true);
         }
         catch (Exception error)
         {
@@ -653,13 +762,13 @@ public sealed class FatWindow : Window
 
     private void PausePreview()
     {
-        try { _previewBackend.Pause(); _previewStatus.Text = "プレビュー: 一時停止"; _ = RefreshPreviewFrameAsync(); }
+        try { _previewBackend.Pause(); _previewStatus.Text = "プレビュー: 一時停止"; _ = RefreshPreviewFrameAsync(force: true); }
         catch (Exception error) { _previewStatus.Text = "プレビュー: エラー"; _status.Text = error.Message; }
     }
 
     private void StopPreview()
     {
-        try { _previewBackend.Stop(); _previewStatus.Text = _input is null ? "プレビュー: 未読込" : "プレビュー: 停止"; UpdatePlaybackSync(); _ = RefreshPreviewFrameAsync(); }
+        try { _previewBackend.Stop(); _previewStatus.Text = _input is null ? "プレビュー: 未読込" : "プレビュー: 停止"; UpdatePlaybackSync(); _ = RefreshPreviewFrameAsync(force: true); }
         catch (Exception error) { _previewStatus.Text = "プレビュー: エラー"; _status.Text = error.Message; }
     }
 
@@ -675,7 +784,7 @@ public sealed class FatWindow : Window
             _previewBackend.Seek(TimeSpan.FromSeconds(clamped));
             if (pause) _previewBackend.Pause();
             UpdatePlaybackSync();
-            _ = RefreshPreviewFrameAsync();
+            _ = RefreshPreviewFrameAsync(force: true);
         }
         catch (Exception error) { _previewStatus.Text = "プレビュー: エラー"; _status.Text = error.Message; }
     }
@@ -696,22 +805,42 @@ public sealed class FatWindow : Window
         if (!_isSeekingWithSlider) _ = RefreshPreviewFrameAsync();
     }
 
-    private async Task RefreshPreviewFrameAsync()
+    private async Task RefreshPreviewFrameAsync(bool force = false)
     {
-        if (_isRefreshingPreviewFrame || _previewBackend.Status == PreviewPlayerStatus.NotLoaded) return;
+        if (_previewBackend.Status == PreviewPlayerStatus.NotLoaded) return;
+        if (_isRefreshingPreviewFrame)
+        {
+            // Let normal playback finish its single decode.  During a seek,
+            // discard it so the next image always represents the latest point.
+            if (!force) return;
+            _previewFrameRefreshCancellation?.Cancel();
+        }
+        if (!force && DateTimeOffset.Now - _lastPreviewFrameDispatch < TimeSpan.FromMilliseconds(100)) return;
+        var cancellation = new CancellationTokenSource();
+        _previewFrameRefreshCancellation = cancellation;
+        _lastPreviewFrameDispatch = DateTimeOffset.Now;
         _isRefreshingPreviewFrame = true;
         try
         {
-            await _previewBackend.RefreshFrameAsync();
+            await _previewBackend.RefreshFrameAsync(cancellation.Token);
             if (_previewBackend.Status is PreviewPlayerStatus.Playing or PreviewPlayerStatus.Paused or PreviewPlayerStatus.Stopped)
                 _previewStatus.Text = $"プレビュー: {_previewBackend.DisplayMode}{(_previewBackend.Status == PreviewPlayerStatus.Playing ? "・再生中" : "")}";
         }
+        catch (OperationCanceledException) { }
         catch (Exception error)
         {
             _previewStatus.Text = "プレビュー: フレーム取得エラー";
             _status.Text = "プレビュー表示を更新できませんでした: " + error.Message;
         }
-        finally { _isRefreshingPreviewFrame = false; }
+        finally
+        {
+            if (ReferenceEquals(_previewFrameRefreshCancellation, cancellation))
+            {
+                _previewFrameRefreshCancellation = null;
+                _isRefreshingPreviewFrame = false;
+            }
+            cancellation.Dispose();
+        }
     }
 
     private static string DescribeAspectRatio(double ratio) => ratio switch
@@ -898,6 +1027,26 @@ public sealed class FatWindow : Window
         overlay.Checked += (_, _) => _showPreviewOverlay.IsChecked = true;
         overlay.Unchecked += (_, _) => _showPreviewOverlay.IsChecked = false;
         panel.Children.Add(overlay);
+        panel.Children.Add(new Separator { Margin = new Thickness(0, 8, 0, 12) });
+        panel.Children.Add(new TextBlock { Text = "ショートカット", FontSize = 18, FontWeight = FontWeights.SemiBold });
+        panel.Children.Add(new TextBlock { Text = "文字入力欄を編集中はショートカットを処理せず、Space や IME 入力を優先します。", TextWrapping = TextWrapping.Wrap, Foreground = System.Windows.Media.Brushes.DimGray, Margin = new Thickness(0, 4, 0, 8) });
+        var shortcutRow = new Grid { Margin = new Thickness(0, 0, 0, 8) };
+        shortcutRow.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        shortcutRow.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
+        var shortcutText = new TextBlock { VerticalAlignment = VerticalAlignment.Center };
+        Grid.SetColumn(shortcutText, 0); shortcutRow.Children.Add(shortcutText);
+        var changeShortcut = new Button { Content = "変更", Padding = new Thickness(12, 6, 12, 6) }.With((_, _) => CapturePlaybackShortcut(window, shortcutText));
+        Grid.SetColumn(changeShortcut, 1); shortcutRow.Children.Add(changeShortcut);
+        panel.Children.Add(shortcutRow);
+        var resetShortcut = AddButton(panel, "初期設定に戻す（Ctrl + Space）", (_, _) =>
+        {
+            _shortcutSettings = ShortcutSettings.Default;
+            _shortcutManager = new ShortcutManager(_shortcutSettings);
+            SaveShortcutSettings();
+            RefreshShortcutText(shortcutText);
+        });
+        resetShortcut.Margin = new Thickness(0, 0, 0, 12);
+        RefreshShortcutText(shortcutText);
         var advanced = AddButton(panel, "認識の詳細設定を開く", (_, _) => { _advancedSettings?.SetCurrentValue(Expander.IsExpandedProperty, true); _recognitionLanguage.Focus(); window.Close(); });
         advanced.Margin = new Thickness(0, 0, 0, 8);
         var update = AddButton(panel, "更新を確認", async (_, _) => await CheckForUpdatesAsync());
@@ -914,6 +1063,47 @@ public sealed class FatWindow : Window
             CanContentScroll = true
         };
         window.ShowDialog();
+    }
+
+    private void RefreshShortcutText(TextBlock target)
+        => target.Text = "再生 / 停止　　 " + _shortcutSettings.Get(ShortcutAction.TogglePreviewPlayback).DisplayText;
+
+    private void CapturePlaybackShortcut(Window owner, TextBlock display)
+    {
+        var dialog = new Window
+        {
+            Title = "ショートカットを変更",
+            Owner = owner,
+            Width = 440,
+            Height = 190,
+            ResizeMode = ResizeMode.NoResize,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            ShowInTaskbar = false
+        };
+        var panel = new StackPanel { Margin = new Thickness(20) };
+        panel.Children.Add(new TextBlock { Text = "再生 / 停止に割り当てるキーを押してください", FontWeight = FontWeights.SemiBold, FontSize = 16 });
+        var value = new TextBlock { Text = "Ctrl / Shift / Alt とキーの組み合わせを入力", Foreground = System.Windows.Media.Brushes.DimGray, Margin = new Thickness(0, 12, 0, 12) };
+        panel.Children.Add(value);
+        panel.Children.Add(new TextBlock { Text = "Esc: キャンセル。文字入力欄では通常入力を優先するため、単独文字キーは実行されません。", TextWrapping = TextWrapping.Wrap, Foreground = System.Windows.Media.Brushes.DimGray });
+        dialog.Content = panel;
+        dialog.PreviewKeyDown += (_, args) =>
+        {
+            var key = NormalizeKey(args);
+            if (key == "Escape") { dialog.Close(); args.Handled = true; return; }
+            if (args.Key is Key.LeftCtrl or Key.RightCtrl or Key.LeftShift or Key.RightShift or Key.LeftAlt or Key.RightAlt) return;
+            var modifiers = Keyboard.Modifiers;
+            var binding = new ShortcutBinding(ShortcutAction.TogglePreviewPlayback, key,
+                modifiers.HasFlag(ModifierKeys.Control), modifiers.HasFlag(ModifierKeys.Shift), modifiers.HasFlag(ModifierKeys.Alt));
+            if (!binding.IsValid()) return;
+            _shortcutSettings = new ShortcutSettings([binding]);
+            _shortcutManager = new ShortcutManager(_shortcutSettings);
+            SaveShortcutSettings();
+            RefreshShortcutText(display);
+            dialog.Close();
+            args.Handled = true;
+        };
+        dialog.Loaded += (_, _) => dialog.Focus();
+        dialog.ShowDialog();
     }
 
     private void StartUninstaller()
@@ -1031,7 +1221,7 @@ public sealed class FatWindow : Window
         panel.Children.Add(button);
         return button;
     }
-    private void ChooseMedia() { var dialog = new OpenFileDialog { Filter = "動画・音声|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.m4a;*.wav;*.flac|すべてのファイル|*.*" }; if (dialog.ShowDialog(this) == true) { _input = dialog.FileName; _media.Text = $"動画素材: {Path.GetFileName(_input)}"; OpenPreviewMedia(_input); } }
+    private async void ChooseMedia() { var dialog = new OpenFileDialog { Filter = "動画・音声|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.m4a;*.wav;*.flac|すべてのファイル|*.*" }; if (dialog.ShowDialog(this) == true) { _input = dialog.FileName; _media.Text = $"動画素材: {Path.GetFileName(_input)}"; await OpenPreviewMediaAsync(_input); } }
     private async Task ToggleRecognitionAsync()
     {
         if (_isRecognizing)

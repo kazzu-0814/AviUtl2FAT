@@ -6,6 +6,32 @@ namespace AviUtl2FAT.Core.Tests;
 public sealed class ProviderAndFilesTests
 {
     [Fact]
+    public void Shortcut_manager_defaults_to_ctrl_space_and_does_not_match_plain_space()
+    {
+        var shortcuts = new ShortcutManager();
+        Assert.True(shortcuts.Matches(ShortcutAction.TogglePreviewPlayback, "Space", ctrl: true, shift: false, alt: false));
+        Assert.False(shortcuts.Matches(ShortcutAction.TogglePreviewPlayback, "Space", ctrl: false, shift: false, alt: false));
+    }
+
+    [Fact]
+    public async Task Shortcut_settings_round_trip_and_broken_json_falls_back_to_ctrl_space()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"fat-shortcuts-{Guid.NewGuid():N}.json");
+        try
+        {
+            var custom = new ShortcutSettings([new ShortcutBinding(ShortcutAction.TogglePreviewPlayback, "P", Ctrl: true)]);
+            await ShortcutSettingsStore.SaveAsync(path, custom, CancellationToken.None);
+            var restored = await ShortcutSettingsStore.LoadAsync(path, CancellationToken.None);
+            Assert.True(new ShortcutManager(restored).Matches(ShortcutAction.TogglePreviewPlayback, "P", ctrl: true, shift: false, alt: false));
+
+            await File.WriteAllTextAsync(path, "{ malformed", new System.Text.UTF8Encoding(false));
+            var fallback = await ShortcutSettingsStore.LoadAsync(path, CancellationToken.None);
+            Assert.True(new ShortcutManager(fallback).Matches(ShortcutAction.TogglePreviewPlayback, "Space", ctrl: true, shift: false, alt: false));
+        }
+        finally { File.Delete(path); File.Delete(path + ".tmp"); }
+    }
+
+    [Fact]
     public void Caption_splitter_handles_japanese_quotes_and_preserves_timing()
     {
         var caption = new FATCaption("one", 0, 8, "原文", "これは「引用符」を含む長い字幕です。安全に分割して、編集可能なテキストとして残します。");
