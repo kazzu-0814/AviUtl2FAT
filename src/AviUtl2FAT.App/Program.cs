@@ -11,6 +11,7 @@ using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
+using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using Microsoft.Win32;
 using AviUtl2FAT.Core;
@@ -49,28 +50,165 @@ public interface IVideoPreviewBackend
     void Stop();
     void Seek(TimeSpan position);
     void Close();
+    Task RefreshFrameAsync(CancellationToken cancellationToken = default);
+    string DisplayMode { get; }
+    double AspectRatio { get; }
 }
 
-public sealed class WpfMediaElementPreviewBackend(MediaElement media) : IVideoPreviewBackend
+/// <summary>
+/// Decoder-compatible preview backed by FAT's bundled FFmpeg instead of Windows Media Foundation.
+/// This avoids the common 0xC00D11B1 codec error while keeping all timeline work inside FAT.
+/// </summary>
+public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
 {
+    private readonly Image _image;
+    private readonly string _ffmpegPath;
+    private readonly string _ffprobePath;
+    private readonly Stopwatch _clock = new();
     private PreviewPlayerStatus _status = PreviewPlayerStatus.NotLoaded;
+    private TimeSpan _position;
+    private TimeSpan _duration;
+    private string? _input;
+    private int _rendering;
+
+    public FfmpegFramePreviewBackend(Image image, string runtimeRoot)
+    {
+        _image = image;
+        _ffmpegPath = Path.Combine(runtimeRoot, "ffmpeg", "ffmpeg.exe");
+        _ffprobePath = Path.Combine(runtimeRoot, "ffmpeg", "ffprobe.exe");
+    }
+
     public PreviewPlayerStatus Status => _status;
-    public TimeSpan Position { get { try { return media.Position; } catch (InvalidOperationException) { return TimeSpan.Zero; } } }
-    public TimeSpan Duration => media.NaturalDuration.HasTimeSpan ? media.NaturalDuration.TimeSpan : TimeSpan.Zero;
-    public double Volume { get => media.Volume; set => media.Volume = Math.Clamp(value, 0, 1); }
+    public TimeSpan Position => _status == PreviewPlayerStatus.Playing ? ClampPosition(_position + _clock.Elapsed) : _position;
+    public TimeSpan Duration => _duration;
+    public double Volume { get; set; } = 0.7;
+    public string DisplayMode => "FFmpeg互換プレビュー";
+    public double AspectRatio { get; private set; } = 16d / 9d;
+
     public void Open(string path)
     {
+        if (!File.Exists(_ffmpegPath) || !File.Exists(_ffprobePath))
+            throw new FatException("FAT_FFMPEG_MISSING", "プレビュー用の FFmpeg / ffprobe が見つかりません。FATを再インストールしてください。");
+        if (!File.Exists(path)) throw new FileNotFoundException("動画ファイルが見つかりません。", path);
+
+        Close();
         _status = PreviewPlayerStatus.Opening;
-        media.Stop();
-        media.Source = new Uri(path, UriKind.Absolute);
-        media.Position = TimeSpan.Zero;
+        _input = path;
+        ReadMetadata(path);
+        _position = TimeSpan.Zero;
         _status = PreviewPlayerStatus.Stopped;
     }
-    public void Play() { media.Play(); _status = PreviewPlayerStatus.Playing; }
-    public void Pause() { media.Pause(); _status = PreviewPlayerStatus.Paused; }
-    public void Stop() { media.Stop(); media.Position = TimeSpan.Zero; _status = media.Source is null ? PreviewPlayerStatus.NotLoaded : PreviewPlayerStatus.Stopped; }
-    public void Seek(TimeSpan position) { media.Position = position < TimeSpan.Zero ? TimeSpan.Zero : position; }
-    public void Close() { media.Stop(); media.Close(); media.Source = null; _status = PreviewPlayerStatus.NotLoaded; }
+    public void Play()
+    {
+        if (_input is null) return;
+        _position = Position;
+        _clock.Restart();
+        _status = PreviewPlayerStatus.Playing;
+    }
+    public void Pause()
+    {
+        if (_status == PreviewPlayerStatus.Playing) _position = Position;
+        _clock.Reset();
+        if (_input is not null) _status = PreviewPlayerStatus.Paused;
+    }
+    public void Stop()
+    {
+        _clock.Reset();
+        _position = TimeSpan.Zero;
+        _status = _input is null ? PreviewPlayerStatus.NotLoaded : PreviewPlayerStatus.Stopped;
+    }
+    public void Seek(TimeSpan position)
+    {
+        _position = ClampPosition(position);
+        if (_status == PreviewPlayerStatus.Playing) _clock.Restart();
+    }
+    public void Close()
+    {
+        _clock.Reset();
+        _position = TimeSpan.Zero;
+        _duration = TimeSpan.Zero;
+        _input = null;
+        _image.Source = null;
+        _status = PreviewPlayerStatus.NotLoaded;
+    }
+
+    public async Task RefreshFrameAsync(CancellationToken cancellationToken = default)
+    {
+        if (_input is null || _status == PreviewPlayerStatus.NotLoaded || Interlocked.Exchange(ref _rendering, 1) != 0) return;
+        try
+        {
+            var position = Position;
+            if (_duration > TimeSpan.Zero && position >= _duration)
+            {
+                _position = _duration;
+                _clock.Reset();
+                _status = PreviewPlayerStatus.Stopped;
+            }
+
+            var start = new ProcessStartInfo(_ffmpegPath)
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            start.ArgumentList.Add("-hide_banner");
+            start.ArgumentList.Add("-loglevel"); start.ArgumentList.Add("error");
+            start.ArgumentList.Add("-ss"); start.ArgumentList.Add(Position.TotalSeconds.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
+            start.ArgumentList.Add("-i"); start.ArgumentList.Add(_input);
+            start.ArgumentList.Add("-frames:v"); start.ArgumentList.Add("1");
+            start.ArgumentList.Add("-vf"); start.ArgumentList.Add("scale='min(1280,iw)':-2");
+            start.ArgumentList.Add("-f"); start.ArgumentList.Add("image2pipe");
+            start.ArgumentList.Add("-vcodec"); start.ArgumentList.Add("png"); start.ArgumentList.Add("pipe:1");
+            using var process = Process.Start(start) ?? throw new InvalidOperationException("FFmpegプレビューを起動できませんでした。");
+            await using var bytes = new MemoryStream();
+            var outputTask = process.StandardOutput.BaseStream.CopyToAsync(bytes, cancellationToken);
+            var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            await Task.WhenAll(outputTask, process.WaitForExitAsync(cancellationToken));
+            var error = await errorTask;
+            if (process.ExitCode != 0 || bytes.Length == 0)
+                throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "FFmpegからプレビュー画像を取得できませんでした。" : error.Trim());
+
+            bytes.Position = 0;
+            var bitmap = new BitmapImage();
+            bitmap.BeginInit(); bitmap.CacheOption = BitmapCacheOption.OnLoad; bitmap.StreamSource = bytes; bitmap.EndInit(); bitmap.Freeze();
+            _image.Source = bitmap;
+        }
+        finally { Interlocked.Exchange(ref _rendering, 0); }
+    }
+
+    private void ReadMetadata(string path)
+    {
+        var start = new ProcessStartInfo(_ffprobePath)
+        {
+            UseShellExecute = false,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            CreateNoWindow = true
+        };
+        start.ArgumentList.Add("-v"); start.ArgumentList.Add("error");
+        start.ArgumentList.Add("-select_streams"); start.ArgumentList.Add("v:0");
+        start.ArgumentList.Add("-show_entries"); start.ArgumentList.Add("format=duration:stream=width,height");
+        start.ArgumentList.Add("-of"); start.ArgumentList.Add("json"); start.ArgumentList.Add(path);
+        using var process = Process.Start(start) ?? throw new InvalidOperationException("ffprobeを起動できませんでした。");
+        var output = process.StandardOutput.ReadToEnd();
+        var error = process.StandardError.ReadToEnd();
+        if (!process.WaitForExit(10_000) || process.ExitCode != 0)
+            throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "動画情報を読み取れませんでした。" : error.Trim());
+        using var document = JsonDocument.Parse(output);
+        var root = document.RootElement;
+        if (root.TryGetProperty("format", out var format) && format.TryGetProperty("duration", out var durationElement) &&
+            double.TryParse(durationElement.GetString(), System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var seconds))
+            _duration = TimeSpan.FromSeconds(Math.Max(0, seconds));
+        if (root.TryGetProperty("streams", out var streams) && streams.GetArrayLength() > 0)
+        {
+            var stream = streams[0];
+            if (stream.TryGetProperty("width", out var width) && stream.TryGetProperty("height", out var height) && height.GetInt32() > 0)
+                AspectRatio = (double)width.GetInt32() / height.GetInt32();
+        }
+    }
+
+    private TimeSpan ClampPosition(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : _duration > TimeSpan.Zero && value > _duration ? _duration : value;
 }
 
 public sealed class FatWindow : Window
@@ -99,11 +237,12 @@ public sealed class FatWindow : Window
     private readonly Button _recognizeButton;
     private readonly Button _naturalizeButton;
     private readonly Button _shortenButton;
-    private readonly MediaElement _previewMedia = new() { LoadedBehavior = MediaState.Manual, UnloadedBehavior = MediaState.Manual, Stretch = System.Windows.Media.Stretch.Uniform };
+    private readonly Image _previewImage = new() { Stretch = System.Windows.Media.Stretch.Uniform, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
     private readonly TextBlock _previewOverlay = new() { Text = "", Foreground = System.Windows.Media.Brushes.White, Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(170, 0, 0, 0)), TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, FontWeight = FontWeights.SemiBold, Padding = new Thickness(12), Margin = new Thickness(24), Visibility = Visibility.Collapsed };
-    private readonly TextBlock _previewStatus = new() { Text = "Preview: 未読込", Foreground = System.Windows.Media.Brushes.DimGray };
+    private readonly TextBlock _previewStatus = new() { Text = "プレビュー: 未読込", Foreground = System.Windows.Media.Brushes.DimGray };
     private readonly TextBlock _previewPosition = new() { Text = "現在: 00:00.000 / 00:00.000" };
     private readonly TextBlock _currentCaptionLabel = new() { Text = "現在字幕: なし", Foreground = System.Windows.Media.Brushes.DimGray };
+    private readonly TextBlock _previewFormat = new() { Text = "表示: 自動", Foreground = System.Windows.Media.Brushes.DimGray };
     private readonly Slider _seekBar = new() { Minimum = 0, Maximum = 1, Value = 0 };
     private readonly CheckBox _autoFollowCaptions = new() { Content = "字幕に追従", IsChecked = true, Margin = new Thickness(8, 0, 8, 0) };
     private readonly CheckBox _showPreviewOverlay = new() { Content = "字幕プレビュー", IsChecked = true, Margin = new Thickness(0, 0, 8, 0) };
@@ -130,11 +269,12 @@ public sealed class FatWindow : Window
     private CaptionRow? _currentCaption;
     private bool _isSeekingWithSlider;
     private bool _isUpdatingCurrentSelection;
+    private bool _isRefreshingPreviewFrame;
     private DateTimeOffset _suspendAutoFollowUntil = DateTimeOffset.MinValue;
 
     public FatWindow()
     {
-        _previewBackend = new WpfMediaElementPreviewBackend(_previewMedia);
+        _previewBackend = new FfmpegFramePreviewBackend(_previewImage, FindRuntime(AppContext.BaseDirectory));
         Title = $"AviUtl2 FAT v{CurrentVersion} - Formation Auto Text"; Width = 1200; Height = 780; MinWidth = 980; MinHeight = 620;
         var root = new Grid { Background = System.Windows.Media.Brushes.White };
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
@@ -176,7 +316,21 @@ public sealed class FatWindow : Window
 
         var progressBox = new StackPanel { Margin = new Thickness(0, 0, 0, 12) }; DockPanel.SetDock(progressBox, Dock.Top); center.Children.Add(progressBox);
         progressBox.Children.Add(new TextBlock { Text = "処理状況", FontWeight = FontWeights.SemiBold }); progressBox.Children.Add(_status); progressBox.Children.Add(_progress);
-        var grid = new DataGrid { AutoGenerateColumns = false, CanUserAddRows = false, ItemsSource = _captions, SelectionMode = DataGridSelectionMode.Extended, SelectionUnit = DataGridSelectionUnit.FullRow };
+        progressBox.Children.Add(new TextBlock { Text = "字幕を編集・同期", FontSize = 16, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 14, 0, 4) });
+        progressBox.Children.Add(new TextBlock { Text = "行をクリックするとプレビュー位置へ移動します。再生中の行は ▶ と淡い青で表示されます。字幕本文は直接編集できます。", Foreground = System.Windows.Media.Brushes.DimGray, Margin = new Thickness(0, 0, 0, 8) });
+        var grid = new DataGrid
+        {
+            AutoGenerateColumns = false,
+            CanUserAddRows = false,
+            ItemsSource = _captions,
+            SelectionMode = DataGridSelectionMode.Extended,
+            SelectionUnit = DataGridSelectionUnit.FullRow,
+            RowHeight = 34,
+            FontSize = 15,
+            AlternatingRowBackground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(248, 250, 252)),
+            GridLinesVisibility = DataGridGridLinesVisibility.Horizontal,
+            HorizontalGridLinesBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 232, 240))
+        };
         var rowStyle = new Style(typeof(DataGridRow));
         rowStyle.Setters.Add(new Setter(DataGridRow.BackgroundProperty, System.Windows.Media.Brushes.White));
         rowStyle.Triggers.Add(new DataTrigger
@@ -189,7 +343,7 @@ public sealed class FatWindow : Window
         grid.Columns.Add(new DataGridTextColumn { Header = "", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.CurrentMarker)), IsReadOnly = true, Width = 32 });
         grid.Columns.Add(new DataGridTextColumn { Header = "Start", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.StartTime)) { StringFormat = "0.000" }, IsReadOnly = true, Width = 90 });
         grid.Columns.Add(new DataGridTextColumn { Header = "End", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.EndTime)) { StringFormat = "0.000" }, IsReadOnly = true, Width = 90 });
-        grid.Columns.Add(new DataGridTextColumn { Header = "字幕（直接編集できます）", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.Text)) { UpdateSourceTrigger = System.Windows.Data.UpdateSourceTrigger.PropertyChanged }, Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
+        grid.Columns.Add(new DataGridTextColumn { Header = "字幕本文（クリックして直接編集）", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.Text)) { UpdateSourceTrigger = System.Windows.Data.UpdateSourceTrigger.PropertyChanged }, Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
         grid.Columns.Add(new DataGridTextColumn { Header = "確認", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.Warning)), IsReadOnly = true, Width = 220 });
         _captionGrid = grid; center.Children.Add(grid);
         grid.PreparingCellForEdit += (_, eventArgs) =>
@@ -259,8 +413,14 @@ public sealed class FatWindow : Window
         var root = new DockPanel();
         panel.Child = root;
 
-        var videoFrame = new Grid { Height = 230, Background = System.Windows.Media.Brushes.Black };
-        videoFrame.Children.Add(_previewMedia);
+        var previewHeader = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
+        previewHeader.Children.Add(new TextBlock { Text = "動画プレビュー", FontWeight = FontWeights.SemiBold, FontSize = 16 });
+        previewHeader.Children.Add(new TextBlock { Text = "　FFmpeg互換表示（16:9 / 9:16 を自動維持）", Foreground = System.Windows.Media.Brushes.DimGray, VerticalAlignment = VerticalAlignment.Bottom });
+        DockPanel.SetDock(previewHeader, Dock.Top);
+        root.Children.Add(previewHeader);
+
+        var videoFrame = new Grid { Height = 280, Background = System.Windows.Media.Brushes.Black, ClipToBounds = true };
+        videoFrame.Children.Add(_previewImage);
         videoFrame.Children.Add(new Border { Child = _previewOverlay, VerticalAlignment = VerticalAlignment.Bottom, Background = System.Windows.Media.Brushes.Transparent });
         DockPanel.SetDock(videoFrame, Dock.Top);
         root.Children.Add(videoFrame);
@@ -268,7 +428,7 @@ public sealed class FatWindow : Window
         var controls = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
         DockPanel.SetDock(controls, Dock.Bottom);
         root.Children.Add(controls);
-        var firstRow = new StackPanel { Orientation = Orientation.Horizontal };
+        var firstRow = new WrapPanel();
         AddButton(firstRow, "▶ 再生", (_, _) => PlayPreview());
         AddButton(firstRow, "⏸ 一時停止", (_, _) => PausePreview());
         AddButton(firstRow, "■ 停止", (_, _) => StopPreview());
@@ -281,8 +441,17 @@ public sealed class FatWindow : Window
         firstRow.Children.Add(new TextBlock { Text = "音量", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 4, 0) });
         firstRow.Children.Add(_previewVolume);
         controls.Children.Add(firstRow);
+        controls.Children.Add(new TextBlock { Text = "タイムライン（ドラッグで移動）", Foreground = System.Windows.Media.Brushes.DimGray, Margin = new Thickness(0, 6, 0, 2) });
         controls.Children.Add(_seekBar);
-        controls.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Children = { _previewPosition, new TextBlock { Text = "　|　" }, _currentCaptionLabel, new TextBlock { Text = "　|　" }, _previewStatus } });
+        var playbackInfo = new WrapPanel { Margin = new Thickness(0, 5, 0, 0) };
+        playbackInfo.Children.Add(_previewPosition);
+        playbackInfo.Children.Add(new TextBlock { Text = "　|　" });
+        playbackInfo.Children.Add(_currentCaptionLabel);
+        playbackInfo.Children.Add(new TextBlock { Text = "　|　" });
+        playbackInfo.Children.Add(_previewFormat);
+        playbackInfo.Children.Add(new TextBlock { Text = "　|　" });
+        playbackInfo.Children.Add(_previewStatus);
+        controls.Children.Add(playbackInfo);
         return panel;
     }
 
@@ -290,17 +459,6 @@ public sealed class FatWindow : Window
     {
         _previewTimer.Tick += (_, _) => UpdatePlaybackSync();
         _previewTimer.Start();
-        _previewMedia.MediaOpened += (_, _) =>
-        {
-            _previewStatus.Text = "Preview: 停止";
-            UpdatePlaybackSync();
-        };
-        _previewMedia.MediaFailed += (_, error) =>
-        {
-            _previewStatus.Text = "Preview: エラー";
-            MessageBox.Show(this, "動画プレビューを再生できませんでした。\n字幕生成は引き続き利用できます。\n\n詳細: " + error.ErrorException.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning);
-        };
-        _previewMedia.MediaEnded += (_, _) => StopPreview();
         _seekBar.PreviewMouseDown += (_, _) => _isSeekingWithSlider = true;
         _seekBar.PreviewMouseUp += (_, _) => { _isSeekingWithSlider = false; SeekPreview(_seekBar.Value, pause: false); };
         _seekBar.ValueChanged += (_, _) => { if (_isSeekingWithSlider) UpdatePreviewPositionLabels(_seekBar.Value, _previewBackend.Duration.TotalSeconds); };
@@ -358,34 +516,36 @@ public sealed class FatWindow : Window
         {
             _previewBackend.Close();
             _previewBackend.Open(path);
-            _previewStatus.Text = "Preview: 準備中";
+            _previewStatus.Text = "プレビュー: フレームを読み込み中";
+            _previewFormat.Text = $"表示: {DescribeAspectRatio(_previewBackend.AspectRatio)}";
             _seekBar.Value = 0;
             UpdatePlaybackSync();
+            _ = RefreshPreviewFrameAsync();
         }
         catch (Exception error)
         {
-            _previewStatus.Text = "Preview: エラー";
-            MessageBox.Show(this, "動画プレビューの読み込みに失敗しました。\n字幕生成は引き続き利用できます。\n\n詳細: " + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning);
+            _previewStatus.Text = "プレビュー: 読み込みエラー";
+            MessageBox.Show(this, "動画プレビューを開けませんでした。\n字幕生成は引き続き利用できます。\n\n詳細: " + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
 
     private void PlayPreview()
     {
         if (string.IsNullOrWhiteSpace(_input)) { _status.Text = "動画を選択するとPreviewを再生できます。"; return; }
-        try { _previewBackend.Play(); _previewStatus.Text = "Preview: 再生中"; UpdatePlaybackSync(); }
-        catch (Exception error) { _previewStatus.Text = "Preview: エラー"; MessageBox.Show(this, "動画プレビューを再生できませんでした。\n字幕生成は引き続き利用できます。\n\n詳細: " + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning); }
+        try { _previewBackend.Play(); _previewStatus.Text = "プレビュー: 再生中"; UpdatePlaybackSync(); }
+        catch (Exception error) { _previewStatus.Text = "プレビュー: エラー"; MessageBox.Show(this, "動画プレビューを再生できませんでした。\n字幕生成は引き続き利用できます。\n\n詳細: " + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning); }
     }
 
     private void PausePreview()
     {
-        try { _previewBackend.Pause(); _previewStatus.Text = "Preview: 一時停止"; }
-        catch (Exception error) { _previewStatus.Text = "Preview: エラー"; _status.Text = error.Message; }
+        try { _previewBackend.Pause(); _previewStatus.Text = "プレビュー: 一時停止"; _ = RefreshPreviewFrameAsync(); }
+        catch (Exception error) { _previewStatus.Text = "プレビュー: エラー"; _status.Text = error.Message; }
     }
 
     private void StopPreview()
     {
-        try { _previewBackend.Stop(); _previewStatus.Text = _input is null ? "Preview: 未読込" : "Preview: 停止"; UpdatePlaybackSync(); }
-        catch (Exception error) { _previewStatus.Text = "Preview: エラー"; _status.Text = error.Message; }
+        try { _previewBackend.Stop(); _previewStatus.Text = _input is null ? "プレビュー: 未読込" : "プレビュー: 停止"; UpdatePlaybackSync(); _ = RefreshPreviewFrameAsync(); }
+        catch (Exception error) { _previewStatus.Text = "プレビュー: エラー"; _status.Text = error.Message; }
     }
 
     private void SeekRelative(double seconds) => SeekPreview(_previewBackend.Position.TotalSeconds + seconds, pause: false);
@@ -400,8 +560,9 @@ public sealed class FatWindow : Window
             _previewBackend.Seek(TimeSpan.FromSeconds(clamped));
             if (pause) _previewBackend.Pause();
             UpdatePlaybackSync();
+            _ = RefreshPreviewFrameAsync();
         }
-        catch (Exception error) { _previewStatus.Text = "Preview: エラー"; _status.Text = error.Message; }
+        catch (Exception error) { _previewStatus.Text = "プレビュー: エラー"; _status.Text = error.Message; }
     }
 
     private void UpdatePlaybackSync()
@@ -417,7 +578,33 @@ public sealed class FatWindow : Window
         var caption = _captionTimeline.FindCaptionAtTime(position.TotalSeconds);
         SetCurrentCaption(caption?.Id);
         UpdatePreviewOverlay();
+        if (!_isSeekingWithSlider) _ = RefreshPreviewFrameAsync();
     }
+
+    private async Task RefreshPreviewFrameAsync()
+    {
+        if (_isRefreshingPreviewFrame || _previewBackend.Status == PreviewPlayerStatus.NotLoaded) return;
+        _isRefreshingPreviewFrame = true;
+        try
+        {
+            await _previewBackend.RefreshFrameAsync();
+            if (_previewBackend.Status is PreviewPlayerStatus.Playing or PreviewPlayerStatus.Paused or PreviewPlayerStatus.Stopped)
+                _previewStatus.Text = $"プレビュー: {_previewBackend.DisplayMode}{(_previewBackend.Status == PreviewPlayerStatus.Playing ? "・再生中" : "")}";
+        }
+        catch (Exception error)
+        {
+            _previewStatus.Text = "プレビュー: フレーム取得エラー";
+            _status.Text = "プレビュー表示を更新できませんでした: " + error.Message;
+        }
+        finally { _isRefreshingPreviewFrame = false; }
+    }
+
+    private static string DescribeAspectRatio(double ratio) => ratio switch
+    {
+        > 1.70 and < 1.85 => "16:9（横）",
+        > 0.50 and < 0.64 => "9:16（縦）",
+        _ => $"自動（{ratio:0.00}:1）"
+    };
 
     private void UpdatePreviewPositionLabels(double positionSeconds, double durationSeconds)
     {
