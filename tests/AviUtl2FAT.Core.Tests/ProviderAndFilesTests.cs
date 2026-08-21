@@ -478,4 +478,42 @@ public sealed class ProviderAndFilesTests
         Assert.Equal(2, new FatUiState(InputPath: "video.mp4").CurrentStep);
         Assert.Contains("精度", CaptionQuality.Warning(new FATCaption("1", 0, 1, "x", "x", Confidence: 0.1)));
     }
+
+    [Fact]
+    public void Caption_timeline_finds_current_caption_and_preserves_gaps()
+    {
+        var timeline = new CaptionTimeline([
+            new FATCaption("a", 0, 2, "", "A"),
+            new FATCaption("b", 7, 9, "", "B")
+        ]);
+
+        Assert.Equal("a", timeline.FindCaptionAtTime(1)?.Id);
+        Assert.Null(timeline.FindCaptionAtTime(4));
+        Assert.Equal("b", timeline.FindCaptionAtTime(8)?.Id);
+    }
+
+    [Fact]
+    public void Caption_timeline_uses_start_inclusive_end_exclusive_boundary()
+    {
+        var timeline = new CaptionTimeline([
+            new FATCaption("a", 0, 2, "", "A"),
+            new FATCaption("b", 2, 4, "", "B")
+        ]);
+
+        Assert.Equal("a", timeline.FindCaptionAtTime(1.999)?.Id);
+        Assert.Equal("b", timeline.FindCaptionAtTime(2.0)?.Id);
+        Assert.Null(timeline.FindCaptionAtTime(4.0));
+    }
+
+    [Fact]
+    public void Caption_timeline_is_rebuilt_after_split_and_merge_inputs()
+    {
+        var split = CaptionSplitter.SplitSelection(new FATCaption("a", 0, 6, "", "abcdef"), 2, 2, minimumSeconds: 0.5);
+        var splitTimeline = new CaptionTimeline(split);
+        Assert.Equal("a-2", splitTimeline.FindCaptionAtTime(split[1].StartTime + 0.01)?.Id);
+
+        var merged = split[0] with { Id = "merged", EndTime = split[^1].EndTime, Text = string.Join("", split.Select(caption => caption.Text)) };
+        var mergedTimeline = new CaptionTimeline([merged]);
+        Assert.Equal("merged", mergedTimeline.FindCaptionAtTime(5.5)?.Id);
+    }
 }

@@ -10,6 +10,8 @@ using System.Text;
 using System.Text.Json;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
+using System.Windows.Threading;
 using Microsoft.Win32;
 using AviUtl2FAT.Core;
 
@@ -18,6 +20,7 @@ namespace AviUtl2FAT.App;
 public sealed class CaptionRow(FATCaption caption) : INotifyPropertyChanged
 {
     private string _text = caption.Text;
+    private bool _isCurrent;
     public string Id { get; } = caption.Id;
     public double StartTime { get; } = caption.StartTime;
     public double EndTime { get; } = caption.EndTime;
@@ -25,11 +28,49 @@ public sealed class CaptionRow(FATCaption caption) : INotifyPropertyChanged
     public string Text { get => _text; set { if (_text != value) { _text = value; Changed(); } } }
     public string Provider { get; private set; } = caption.Provider;
     public string? Model { get; private set; } = caption.Model;
+    public bool IsCurrent { get => _isCurrent; set { if (_isCurrent != value) { _isCurrent = value; Changed(); Changed(nameof(CurrentMarker)); } } }
+    public string CurrentMarker => IsCurrent ? "▶" : string.Empty;
     public string Warning => CaptionQuality.Warning(ToCaption()) is { } warning ? "⚠ 要確認: " + warning : string.Empty;
     public FATCaption ToCaption() => new(Id, StartTime, EndTime, OriginalTranscript, Text, Provider, Model, caption.Confidence, caption.Enabled, caption.DetectedLanguage, caption.OutputLanguage);
     public void Apply(FATCaption caption) { _text = caption.Text; Provider = caption.Provider; Model = caption.Model; Changed(nameof(Text)); Changed(nameof(Warning)); }
     public event PropertyChangedEventHandler? PropertyChanged;
     private void Changed([CallerMemberName] string? name = null) { PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name)); if (name == nameof(Text)) PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Warning))); }
+}
+
+public interface IVideoPreviewBackend
+{
+    PreviewPlayerStatus Status { get; }
+    TimeSpan Position { get; }
+    TimeSpan Duration { get; }
+    double Volume { get; set; }
+    void Open(string path);
+    void Play();
+    void Pause();
+    void Stop();
+    void Seek(TimeSpan position);
+    void Close();
+}
+
+public sealed class WpfMediaElementPreviewBackend(MediaElement media) : IVideoPreviewBackend
+{
+    private PreviewPlayerStatus _status = PreviewPlayerStatus.NotLoaded;
+    public PreviewPlayerStatus Status => _status;
+    public TimeSpan Position { get { try { return media.Position; } catch (InvalidOperationException) { return TimeSpan.Zero; } } }
+    public TimeSpan Duration => media.NaturalDuration.HasTimeSpan ? media.NaturalDuration.TimeSpan : TimeSpan.Zero;
+    public double Volume { get => media.Volume; set => media.Volume = Math.Clamp(value, 0, 1); }
+    public void Open(string path)
+    {
+        _status = PreviewPlayerStatus.Opening;
+        media.Stop();
+        media.Source = new Uri(path, UriKind.Absolute);
+        media.Position = TimeSpan.Zero;
+        _status = PreviewPlayerStatus.Stopped;
+    }
+    public void Play() { media.Play(); _status = PreviewPlayerStatus.Playing; }
+    public void Pause() { media.Pause(); _status = PreviewPlayerStatus.Paused; }
+    public void Stop() { media.Stop(); media.Position = TimeSpan.Zero; _status = media.Source is null ? PreviewPlayerStatus.NotLoaded : PreviewPlayerStatus.Stopped; }
+    public void Seek(TimeSpan position) { media.Position = position < TimeSpan.Zero ? TimeSpan.Zero : position; }
+    public void Close() { media.Stop(); media.Close(); media.Source = null; _status = PreviewPlayerStatus.NotLoaded; }
 }
 
 public sealed class FatWindow : Window
@@ -58,6 +99,17 @@ public sealed class FatWindow : Window
     private readonly Button _recognizeButton;
     private readonly Button _naturalizeButton;
     private readonly Button _shortenButton;
+    private readonly MediaElement _previewMedia = new() { LoadedBehavior = MediaState.Manual, UnloadedBehavior = MediaState.Manual, Stretch = System.Windows.Media.Stretch.Uniform };
+    private readonly TextBlock _previewOverlay = new() { Text = "", Foreground = System.Windows.Media.Brushes.White, Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(170, 0, 0, 0)), TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, FontWeight = FontWeights.SemiBold, Padding = new Thickness(12), Margin = new Thickness(24), Visibility = Visibility.Collapsed };
+    private readonly TextBlock _previewStatus = new() { Text = "Preview: 未読込", Foreground = System.Windows.Media.Brushes.DimGray };
+    private readonly TextBlock _previewPosition = new() { Text = "現在: 00:00.000 / 00:00.000" };
+    private readonly TextBlock _currentCaptionLabel = new() { Text = "現在字幕: なし", Foreground = System.Windows.Media.Brushes.DimGray };
+    private readonly Slider _seekBar = new() { Minimum = 0, Maximum = 1, Value = 0 };
+    private readonly CheckBox _autoFollowCaptions = new() { Content = "字幕に追従", IsChecked = true, Margin = new Thickness(8, 0, 8, 0) };
+    private readonly CheckBox _showPreviewOverlay = new() { Content = "字幕プレビュー", IsChecked = true, Margin = new Thickness(0, 0, 8, 0) };
+    private readonly Slider _previewVolume = new() { Minimum = 0, Maximum = 1, Value = 0.7, Width = 90 };
+    private readonly DispatcherTimer _previewTimer = new() { Interval = TimeSpan.FromMilliseconds(250) };
+    private readonly IVideoPreviewBackend _previewBackend;
     private DataGrid? _captionGrid;
     private CaptionRow? _editingCaption;
     private int _textSelectionStart;
@@ -67,15 +119,22 @@ public sealed class FatWindow : Window
     private AviUtl2ObjectTemplate _objectTemplate = AviUtl2ObjectTemplate.CreateStandard();
     private AviUtl2TextStyle _style = AviUtl2TextStyle.Default;
     private readonly string _aiSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
+    private readonly string _previewSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "preview-settings.json");
     private string? _input;
     private bool _isRecognizing;
     private CancellationTokenSource? _recognitionCancellation;
     private readonly Dictionary<string, Button> _navigationButtons = new(StringComparer.Ordinal);
     private Expander? _advancedSettings;
     private Border? _homeCard;
+    private CaptionTimeline _captionTimeline = new([]);
+    private CaptionRow? _currentCaption;
+    private bool _isSeekingWithSlider;
+    private bool _isUpdatingCurrentSelection;
+    private DateTimeOffset _suspendAutoFollowUntil = DateTimeOffset.MinValue;
 
     public FatWindow()
     {
+        _previewBackend = new WpfMediaElementPreviewBackend(_previewMedia);
         Title = $"AviUtl2 FAT v{CurrentVersion} - Formation Auto Text"; Width = 1200; Height = 780; MinWidth = 980; MinHeight = 620;
         var root = new Grid { Background = System.Windows.Media.Brushes.White };
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
@@ -111,9 +170,23 @@ public sealed class FatWindow : Window
         details.Children.Add(new TextBlock { Text = "音声認識:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_recognitionProfile);
         advanced.Content = details; home.Children.Add(advanced); _advancedSettings = advanced;
 
+        var previewPanel = CreatePreviewPanel();
+        DockPanel.SetDock(previewPanel, Dock.Top);
+        center.Children.Add(previewPanel);
+
         var progressBox = new StackPanel { Margin = new Thickness(0, 0, 0, 12) }; DockPanel.SetDock(progressBox, Dock.Top); center.Children.Add(progressBox);
         progressBox.Children.Add(new TextBlock { Text = "処理状況", FontWeight = FontWeights.SemiBold }); progressBox.Children.Add(_status); progressBox.Children.Add(_progress);
         var grid = new DataGrid { AutoGenerateColumns = false, CanUserAddRows = false, ItemsSource = _captions, SelectionMode = DataGridSelectionMode.Extended, SelectionUnit = DataGridSelectionUnit.FullRow };
+        var rowStyle = new Style(typeof(DataGridRow));
+        rowStyle.Setters.Add(new Setter(DataGridRow.BackgroundProperty, System.Windows.Media.Brushes.White));
+        rowStyle.Triggers.Add(new DataTrigger
+        {
+            Binding = new System.Windows.Data.Binding(nameof(CaptionRow.IsCurrent)),
+            Value = true,
+            Setters = { new Setter(DataGridRow.BackgroundProperty, new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(219, 234, 254))) }
+        });
+        grid.RowStyle = rowStyle;
+        grid.Columns.Add(new DataGridTextColumn { Header = "", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.CurrentMarker)), IsReadOnly = true, Width = 32 });
         grid.Columns.Add(new DataGridTextColumn { Header = "Start", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.StartTime)) { StringFormat = "0.000" }, IsReadOnly = true, Width = 90 });
         grid.Columns.Add(new DataGridTextColumn { Header = "End", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.EndTime)) { StringFormat = "0.000" }, IsReadOnly = true, Width = 90 });
         grid.Columns.Add(new DataGridTextColumn { Header = "字幕（直接編集できます）", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.Text)) { UpdateSourceTrigger = System.Windows.Data.UpdateSourceTrigger.PropertyChanged }, Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
@@ -127,6 +200,21 @@ public sealed class FatWindow : Window
             editor.SelectionChanged += CaptureSelection;
             editor.LostKeyboardFocus += CaptureSelection;
             CaptureSelection(null, EventArgs.Empty);
+        };
+        grid.SelectionChanged += (_, _) =>
+        {
+            if (_isUpdatingCurrentSelection) return;
+            _suspendAutoFollowUntil = DateTimeOffset.Now.AddSeconds(2);
+            if (grid.SelectedItem is CaptionRow row && !_isSeekingWithSlider) SeekPreview(row.StartTime, pause: false);
+            UpdatePreviewOverlay();
+        };
+        grid.MouseDoubleClick += (_, _) =>
+        {
+            if (grid.SelectedItem is CaptionRow row)
+            {
+                SeekPreview(row.StartTime, pause: false);
+                PlayPreview();
+            }
         };
 
         var inspector = new StackPanel { Margin = new Thickness(8, 24, 24, 14) }; Grid.SetColumn(inspector, 2); root.Children.Add(inspector);
@@ -159,8 +247,238 @@ public sealed class FatWindow : Window
         _aiProvider.SelectionChanged += async (_, _) => { UpdateAiState(); await SaveAiSettingsAsync(); };
         _codexBackend.SelectionChanged += async (_, _) => await SaveAiSettingsAsync();
         UpdateAiState();
+        LoadPreviewSettings();
+        ConfigurePreviewEvents();
         SelectNavigation("ホーム");
-        Closed += (_, _) => { _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
+        Closed += (_, _) => { SavePreviewSettings(); _previewTimer.Stop(); _previewBackend.Close(); _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
+    }
+
+    private Border CreatePreviewPanel()
+    {
+        var panel = new Border { BorderBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 232, 240)), BorderThickness = new Thickness(1), CornerRadius = new CornerRadius(8), Margin = new Thickness(0, 0, 0, 12), Padding = new Thickness(10) };
+        var root = new DockPanel();
+        panel.Child = root;
+
+        var videoFrame = new Grid { Height = 230, Background = System.Windows.Media.Brushes.Black };
+        videoFrame.Children.Add(_previewMedia);
+        videoFrame.Children.Add(new Border { Child = _previewOverlay, VerticalAlignment = VerticalAlignment.Bottom, Background = System.Windows.Media.Brushes.Transparent });
+        DockPanel.SetDock(videoFrame, Dock.Top);
+        root.Children.Add(videoFrame);
+
+        var controls = new StackPanel { Margin = new Thickness(0, 8, 0, 0) };
+        DockPanel.SetDock(controls, Dock.Bottom);
+        root.Children.Add(controls);
+        var firstRow = new StackPanel { Orientation = Orientation.Horizontal };
+        AddButton(firstRow, "▶ 再生", (_, _) => PlayPreview());
+        AddButton(firstRow, "⏸ 一時停止", (_, _) => PausePreview());
+        AddButton(firstRow, "■ 停止", (_, _) => StopPreview());
+        AddButton(firstRow, "-5秒", (_, _) => SeekRelative(-5));
+        AddButton(firstRow, "-1秒", (_, _) => SeekRelative(-1));
+        AddButton(firstRow, "+1秒", (_, _) => SeekRelative(1));
+        AddButton(firstRow, "+5秒", (_, _) => SeekRelative(5));
+        firstRow.Children.Add(_autoFollowCaptions);
+        firstRow.Children.Add(_showPreviewOverlay);
+        firstRow.Children.Add(new TextBlock { Text = "音量", VerticalAlignment = VerticalAlignment.Center, Margin = new Thickness(6, 0, 4, 0) });
+        firstRow.Children.Add(_previewVolume);
+        controls.Children.Add(firstRow);
+        controls.Children.Add(_seekBar);
+        controls.Children.Add(new StackPanel { Orientation = Orientation.Horizontal, Children = { _previewPosition, new TextBlock { Text = "　|　" }, _currentCaptionLabel, new TextBlock { Text = "　|　" }, _previewStatus } });
+        return panel;
+    }
+
+    private void ConfigurePreviewEvents()
+    {
+        _previewTimer.Tick += (_, _) => UpdatePlaybackSync();
+        _previewTimer.Start();
+        _previewMedia.MediaOpened += (_, _) =>
+        {
+            _previewStatus.Text = "Preview: 停止";
+            UpdatePlaybackSync();
+        };
+        _previewMedia.MediaFailed += (_, error) =>
+        {
+            _previewStatus.Text = "Preview: エラー";
+            MessageBox.Show(this, "動画プレビューを再生できませんでした。\n字幕生成は引き続き利用できます。\n\n詳細: " + error.ErrorException.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning);
+        };
+        _previewMedia.MediaEnded += (_, _) => StopPreview();
+        _seekBar.PreviewMouseDown += (_, _) => _isSeekingWithSlider = true;
+        _seekBar.PreviewMouseUp += (_, _) => { _isSeekingWithSlider = false; SeekPreview(_seekBar.Value, pause: false); };
+        _seekBar.ValueChanged += (_, _) => { if (_isSeekingWithSlider) UpdatePreviewPositionLabels(_seekBar.Value, _previewBackend.Duration.TotalSeconds); };
+        _previewVolume.ValueChanged += (_, _) => { _previewBackend.Volume = _previewVolume.Value; SavePreviewSettings(); };
+        _autoFollowCaptions.Checked += (_, _) => SavePreviewSettings();
+        _autoFollowCaptions.Unchecked += (_, _) => SavePreviewSettings();
+        _showPreviewOverlay.Checked += (_, _) => { SavePreviewSettings(); UpdatePreviewOverlay(); };
+        _showPreviewOverlay.Unchecked += (_, _) => { SavePreviewSettings(); UpdatePreviewOverlay(); };
+        PreviewKeyDown += (_, args) =>
+        {
+            if (args.Key == Key.Space)
+            {
+                if (_previewBackend.Status == PreviewPlayerStatus.Playing) PausePreview(); else PlayPreview();
+                args.Handled = true;
+            }
+            else if (args.Key is Key.Left or Key.Right)
+            {
+                var direction = args.Key == Key.Right ? 1 : -1;
+                SeekRelative(Keyboard.Modifiers.HasFlag(ModifierKeys.Shift) ? 5 * direction : direction);
+                args.Handled = true;
+            }
+        };
+    }
+
+    private void LoadPreviewSettings()
+    {
+        try
+        {
+            if (File.Exists(_previewSettingsPath))
+            {
+                var settings = JsonSerializer.Deserialize<PreviewSettings>(File.ReadAllText(_previewSettingsPath), JsonOptions) ?? new PreviewSettings();
+                _autoFollowCaptions.IsChecked = settings.AutoFollowCaptions;
+                _showPreviewOverlay.IsChecked = settings.ShowSubtitleOverlay;
+                _previewVolume.Value = Math.Clamp(settings.Volume, 0, 1);
+            }
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException or JsonException) { }
+        _previewBackend.Volume = _previewVolume.Value;
+    }
+
+    private void SavePreviewSettings()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_previewSettingsPath)!);
+            var settings = new PreviewSettings(_autoFollowCaptions.IsChecked == true, _showPreviewOverlay.IsChecked == true, _previewVolume.Value);
+            File.WriteAllText(_previewSettingsPath, JsonSerializer.Serialize(settings, JsonOptions), new UTF8Encoding(false));
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
+    }
+
+    private void OpenPreviewMedia(string path)
+    {
+        try
+        {
+            _previewBackend.Close();
+            _previewBackend.Open(path);
+            _previewStatus.Text = "Preview: 準備中";
+            _seekBar.Value = 0;
+            UpdatePlaybackSync();
+        }
+        catch (Exception error)
+        {
+            _previewStatus.Text = "Preview: エラー";
+            MessageBox.Show(this, "動画プレビューの読み込みに失敗しました。\n字幕生成は引き続き利用できます。\n\n詳細: " + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning);
+        }
+    }
+
+    private void PlayPreview()
+    {
+        if (string.IsNullOrWhiteSpace(_input)) { _status.Text = "動画を選択するとPreviewを再生できます。"; return; }
+        try { _previewBackend.Play(); _previewStatus.Text = "Preview: 再生中"; UpdatePlaybackSync(); }
+        catch (Exception error) { _previewStatus.Text = "Preview: エラー"; MessageBox.Show(this, "動画プレビューを再生できませんでした。\n字幕生成は引き続き利用できます。\n\n詳細: " + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning); }
+    }
+
+    private void PausePreview()
+    {
+        try { _previewBackend.Pause(); _previewStatus.Text = "Preview: 一時停止"; }
+        catch (Exception error) { _previewStatus.Text = "Preview: エラー"; _status.Text = error.Message; }
+    }
+
+    private void StopPreview()
+    {
+        try { _previewBackend.Stop(); _previewStatus.Text = _input is null ? "Preview: 未読込" : "Preview: 停止"; UpdatePlaybackSync(); }
+        catch (Exception error) { _previewStatus.Text = "Preview: エラー"; _status.Text = error.Message; }
+    }
+
+    private void SeekRelative(double seconds) => SeekPreview(_previewBackend.Position.TotalSeconds + seconds, pause: false);
+
+    private void SeekPreview(double seconds, bool pause)
+    {
+        if (_previewBackend.Status == PreviewPlayerStatus.NotLoaded) return;
+        var duration = _previewBackend.Duration.TotalSeconds;
+        var clamped = duration > 0 ? Math.Clamp(seconds, 0, duration) : Math.Max(0, seconds);
+        try
+        {
+            _previewBackend.Seek(TimeSpan.FromSeconds(clamped));
+            if (pause) _previewBackend.Pause();
+            UpdatePlaybackSync();
+        }
+        catch (Exception error) { _previewStatus.Text = "Preview: エラー"; _status.Text = error.Message; }
+    }
+
+    private void UpdatePlaybackSync()
+    {
+        var position = _isSeekingWithSlider ? TimeSpan.FromSeconds(_seekBar.Value) : _previewBackend.Position;
+        var duration = _previewBackend.Duration;
+        if (!_isSeekingWithSlider)
+        {
+            _seekBar.Maximum = Math.Max(1, duration.TotalSeconds);
+            _seekBar.Value = Math.Clamp(position.TotalSeconds, 0, _seekBar.Maximum);
+        }
+        UpdatePreviewPositionLabels(position.TotalSeconds, duration.TotalSeconds);
+        var caption = _captionTimeline.FindCaptionAtTime(position.TotalSeconds);
+        SetCurrentCaption(caption?.Id);
+        UpdatePreviewOverlay();
+    }
+
+    private void UpdatePreviewPositionLabels(double positionSeconds, double durationSeconds)
+    {
+        _previewPosition.Text = $"現在: {FormatPlaybackTime(positionSeconds)} / {FormatPlaybackTime(durationSeconds)}";
+    }
+
+    private static string FormatPlaybackTime(double seconds)
+    {
+        if (double.IsNaN(seconds) || double.IsInfinity(seconds) || seconds < 0) seconds = 0;
+        var span = TimeSpan.FromSeconds(seconds);
+        return span.TotalHours >= 1 ? $@"{span:hh\:mm\:ss\.fff}" : $@"{span:mm\:ss\.fff}";
+    }
+
+    private void SetCurrentCaption(string? captionId)
+    {
+        if (string.Equals(_currentCaption?.Id, captionId, StringComparison.Ordinal)) return;
+        if (_currentCaption is not null) _currentCaption.IsCurrent = false;
+        _currentCaption = captionId is null ? null : _captions.FirstOrDefault(row => string.Equals(row.Id, captionId, StringComparison.Ordinal));
+        if (_currentCaption is not null) _currentCaption.IsCurrent = true;
+        var index = _currentCaption is null ? -1 : _captions.IndexOf(_currentCaption);
+        _currentCaptionLabel.Text = index < 0 ? "現在字幕: なし" : $"現在字幕: {index + 1} / {_captions.Count}";
+        if (_currentCaption is not null && _autoFollowCaptions.IsChecked == true && DateTimeOffset.Now >= _suspendAutoFollowUntil && _captionGrid is not null)
+        {
+            _isUpdatingCurrentSelection = true;
+            try
+            {
+                _captionGrid.SelectedItem = _currentCaption;
+                _captionGrid.ScrollIntoView(_currentCaption);
+            }
+            finally
+            {
+                _isUpdatingCurrentSelection = false;
+            }
+        }
+    }
+
+    private void UpdatePreviewOverlay()
+    {
+        if (_showPreviewOverlay.IsChecked != true || _currentCaption is null || string.IsNullOrWhiteSpace(_currentCaption.Text))
+        {
+            _previewOverlay.Visibility = Visibility.Collapsed;
+            _previewOverlay.Text = string.Empty;
+            return;
+        }
+
+        _previewOverlay.Text = _currentCaption.Text;
+        _previewOverlay.FontFamily = new System.Windows.Media.FontFamily(string.IsNullOrWhiteSpace(_style.Font) ? "Yu Gothic UI" : _style.Font);
+        var styleSize = double.TryParse(_style.Size, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsedSize) ? parsedSize : 96;
+        _previewOverlay.FontSize = Math.Clamp(styleSize / 3.2, 18, 46);
+        _previewOverlay.Foreground = new System.Windows.Media.SolidColorBrush(ParseRgb(_style.TextColor, System.Windows.Media.Colors.White));
+        _previewOverlay.Visibility = Visibility.Visible;
+    }
+
+    private static System.Windows.Media.Color ParseRgb(string value, System.Windows.Media.Color fallback)
+    {
+        if (value.Length != 6) return fallback;
+        return byte.TryParse(value[..2], System.Globalization.NumberStyles.HexNumber, null, out var r)
+            && byte.TryParse(value.Substring(2, 2), System.Globalization.NumberStyles.HexNumber, null, out var g)
+            && byte.TryParse(value.Substring(4, 2), System.Globalization.NumberStyles.HexNumber, null, out var b)
+            ? System.Windows.Media.Color.FromRgb(r, g, b)
+            : fallback;
     }
 
     private Button CreateNavigationButton(string destination)
@@ -252,6 +570,15 @@ public sealed class FatWindow : Window
         var panel = new StackPanel { Margin = new Thickness(20) };
         panel.Children.Add(new TextBlock { Text = "認識と更新", FontSize = 20, FontWeight = FontWeights.SemiBold });
         panel.Children.Add(new TextBlock { Text = "認識言語・字幕言語・認識プロファイルはホームの「詳細設定」から変更できます。アプリ更新はGitHub Releaseを確認し、ユーザーが選んだ場合だけインストーラーをダウンロードします。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 12) });
+        panel.Children.Add(new TextBlock { Text = "プレビュー", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 2, 0, 6) });
+        var follow = new CheckBox { Content = "字幕に自動追従", IsChecked = _autoFollowCaptions.IsChecked, Margin = new Thickness(0, 0, 0, 4) };
+        follow.Checked += (_, _) => _autoFollowCaptions.IsChecked = true;
+        follow.Unchecked += (_, _) => _autoFollowCaptions.IsChecked = false;
+        panel.Children.Add(follow);
+        var overlay = new CheckBox { Content = "動画プレビュー上に字幕を表示", IsChecked = _showPreviewOverlay.IsChecked, Margin = new Thickness(0, 0, 0, 10) };
+        overlay.Checked += (_, _) => _showPreviewOverlay.IsChecked = true;
+        overlay.Unchecked += (_, _) => _showPreviewOverlay.IsChecked = false;
+        panel.Children.Add(overlay);
         var advanced = AddButton(panel, "認識の詳細設定を開く", (_, _) => { _advancedSettings?.SetCurrentValue(Expander.IsExpandedProperty, true); _recognitionLanguage.Focus(); window.Close(); });
         advanced.Margin = new Thickness(0, 0, 0, 8);
         var update = AddButton(panel, "更新を確認", async (_, _) => await CheckForUpdatesAsync());
@@ -379,7 +706,7 @@ public sealed class FatWindow : Window
         panel.Children.Add(button);
         return button;
     }
-    private void ChooseMedia() { var dialog = new OpenFileDialog { Filter = "動画・音声|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.m4a;*.wav;*.flac|すべてのファイル|*.*" }; if (dialog.ShowDialog(this) == true) { _input = dialog.FileName; _media.Text = $"動画素材: {Path.GetFileName(_input)}"; } }
+    private void ChooseMedia() { var dialog = new OpenFileDialog { Filter = "動画・音声|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.m4a;*.wav;*.flac|すべてのファイル|*.*" }; if (dialog.ShowDialog(this) == true) { _input = dialog.FileName; _media.Text = $"動画素材: {Path.GetFileName(_input)}"; OpenPreviewMedia(_input); } }
     private async Task ToggleRecognitionAsync()
     {
         if (_isRecognizing)
@@ -406,7 +733,7 @@ public sealed class FatWindow : Window
             _progress.Value = 0; _status.Text = "Starting worker...";
             var output = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", $"{Guid.NewGuid():N}.att.json");
             var recognitionLanguage = SelectedLanguage(_recognitionLanguage); var outputLanguage = SelectedLanguage(_outputLanguage);
-            await RunWorkerAsync(new RecognitionRequest(_input, output, new FatSettings { Version = "1.0.0", Language = recognitionLanguage, RecognitionLanguage = recognitionLanguage, CaptionOutputLanguage = outputLanguage, SpeechProfile = (string)((ComboBoxItem)_recognitionProfile.SelectedItem).Tag }), p => { _status.Text = p.Message; if (p.Value is not null) _progress.Value = Math.Clamp(p.Value.Value, 0, 100); }, _recognitionCancellation.Token);
+            await RunWorkerAsync(new RecognitionRequest(_input, output, new FatSettings { Version = CurrentVersion, Language = recognitionLanguage, RecognitionLanguage = recognitionLanguage, CaptionOutputLanguage = outputLanguage, SpeechProfile = (string)((ComboBoxItem)_recognitionProfile.SelectedItem).Tag }), p => { _status.Text = p.Message; if (p.Value is not null) _progress.Value = Math.Clamp(p.Value.Value, 0, 100); }, _recognitionCancellation.Token);
             var transcript = await FatFiles.ReadAttTranscriptAsync(output, CancellationToken.None);
             var response = await _providers.GetRequired("passthrough").GenerateCaptionsAsync(new CaptionGenerationRequest(transcript), CancellationToken.None);
             _lastGenerated = response.Captions; Load(response.Captions); _progress.Value = 100; _status.Text = $"完了: {_captions.Count} 件の字幕を編集できます。";
@@ -625,7 +952,25 @@ public sealed class FatWindow : Window
         else if (_lastGenerated.Count > 0) { Load(_lastGenerated); _status.Text = "認識直後の字幕へ戻しました。"; }
         else Error("FAT_UNDO_EMPTY", "元に戻せる変更がありません。");
     }
-    private void Load(IReadOnlyList<FATCaption> captions) { _captions.Clear(); foreach (var caption in captions) _captions.Add(new CaptionRow(caption)); _editingCaption = null; _textSelectionStart = 0; _textSelectionLength = 0; }
+    private void Load(IReadOnlyList<FATCaption> captions)
+    {
+        _captions.Clear();
+        foreach (var caption in captions)
+        {
+            var row = new CaptionRow(caption);
+            row.PropertyChanged += (_, eventArgs) =>
+            {
+                if (eventArgs.PropertyName == nameof(CaptionRow.Text) && ReferenceEquals(row, _currentCaption)) UpdatePreviewOverlay();
+            };
+            _captions.Add(row);
+        }
+        _captionTimeline = new CaptionTimeline(_captions.Select(row => row.ToCaption()));
+        _currentCaption = null;
+        _editingCaption = null;
+        _textSelectionStart = 0;
+        _textSelectionLength = 0;
+        UpdatePlaybackSync();
+    }
     private void Error(string code, string message)
     {
         _status.Text = $"Error ({code})";
