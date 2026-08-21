@@ -289,7 +289,19 @@ public sealed class FatWindow : Window
             navigation.Children.Add(CreateNavigationButton(item));
         Grid.SetColumn(navigation, 0); root.Children.Add(navigation);
 
-        var center = new DockPanel { Margin = new Thickness(28, 24, 20, 14) }; Grid.SetColumn(center, 1); root.Children.Add(center);
+        // The home, preview and caption editor are intentionally one vertical
+        // workflow.  Keep the whole workflow reachable on small displays while
+        // retaining the DataGrid's own scrollbar for long caption lists.
+        var centerScroll = new ScrollViewer
+        {
+            Margin = new Thickness(28, 24, 20, 14),
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            CanContentScroll = true
+        };
+        Grid.SetColumn(centerScroll, 1); root.Children.Add(centerScroll);
+        var center = new DockPanel { LastChildFill = false };
+        centerScroll.Content = center;
         var heading = new StackPanel { Margin = new Thickness(0, 0, 0, 14) }; DockPanel.SetDock(heading, Dock.Top); center.Children.Add(heading);
         heading.Children.Add(new TextBlock { Text = "動画から字幕を作成", FontSize = 27, FontWeight = FontWeights.SemiBold });
         heading.Children.Add(new TextBlock { Text = "1. 動画を選ぶ 　→　2. 字幕を作る 　→　3. 必要ならAIで整える 　→　4. 自分で直す 　→　5. AviUtl2へ出力", Foreground = System.Windows.Media.Brushes.DimGray, Margin = new Thickness(0, 6, 0, 12) });
@@ -329,7 +341,11 @@ public sealed class FatWindow : Window
             FontSize = 15,
             AlternatingRowBackground = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(248, 250, 252)),
             GridLinesVisibility = DataGridGridLinesVisibility.Horizontal,
-            HorizontalGridLinesBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 232, 240))
+            HorizontalGridLinesBrush = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(226, 232, 240)),
+            MinHeight = 260,
+            Height = 420,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Auto
         };
         var rowStyle = new Style(typeof(DataGridRow));
         rowStyle.Setters.Add(new Setter(DataGridRow.BackgroundProperty, System.Windows.Media.Brushes.White));
@@ -753,7 +769,17 @@ public sealed class FatWindow : Window
 
     private void ShowSettingsWindow()
     {
-        var window = new Window { Title = "設定 / 更新", Owner = this, Width = 500, Height = 300, WindowStartupLocation = WindowStartupLocation.CenterOwner, ResizeMode = ResizeMode.NoResize };
+        var window = new Window
+        {
+            Title = "設定 / 更新",
+            Owner = this,
+            Width = 540,
+            Height = 560,
+            MinWidth = 440,
+            MinHeight = 360,
+            WindowStartupLocation = WindowStartupLocation.CenterOwner,
+            ResizeMode = ResizeMode.CanResize
+        };
         var panel = new StackPanel { Margin = new Thickness(20) };
         panel.Children.Add(new TextBlock { Text = "認識と更新", FontSize = 20, FontWeight = FontWeights.SemiBold });
         panel.Children.Add(new TextBlock { Text = "認識言語・字幕言語・認識プロファイルはホームの「詳細設定」から変更できます。アプリ更新はGitHub Releaseを確認し、ユーザーが選んだ場合だけインストーラーをダウンロードします。", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 12) });
@@ -774,7 +800,13 @@ public sealed class FatWindow : Window
         releases.Margin = new Thickness(0, 0, 0, 8);
         var uninstall = AddButton(panel, "AviUtl2 FATをアンインストール...", (_, _) => StartUninstaller());
         uninstall.ToolTip = "FATのみを削除します。AviUtl2本体や他のプラグインには変更を加えません。";
-        window.Content = panel;
+        window.Content = new ScrollViewer
+        {
+            Content = panel,
+            VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+            HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
+            CanContentScroll = true
+        };
         window.ShowDialog();
     }
 
