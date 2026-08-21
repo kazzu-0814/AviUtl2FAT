@@ -70,6 +70,11 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
     private TimeSpan _duration;
     private string? _input;
     private int _rendering;
+    private readonly System.Windows.Media.MediaPlayer _audioPlayer = new();
+    private CancellationTokenSource? _audioCancellation;
+    private string? _temporaryAudioPath;
+    private int _audioGeneration;
+    private double _volume = 0.7;
 
     public FfmpegFramePreviewBackend(Image image, string runtimeRoot)
     {
@@ -81,8 +86,12 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
     public PreviewPlayerStatus Status => _status;
     public TimeSpan Position => _status == PreviewPlayerStatus.Playing ? ClampPosition(_position + _clock.Elapsed) : _position;
     public TimeSpan Duration => _duration;
-    public double Volume { get; set; } = 0.7;
-    public string DisplayMode => "FFmpeg互換プレビュー";
+    public double Volume
+    {
+        get => _volume;
+        set { _volume = Math.Clamp(value, 0, 1); _audioPlayer.Volume = _volume; }
+    }
+    public string DisplayMode => "FFmpeg互換プレビュー（音声対応）";
     public double AspectRatio { get; private set; } = 16d / 9d;
 
     public void Open(string path)
@@ -104,23 +113,38 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
         _position = Position;
         _clock.Restart();
         _status = PreviewPlayerStatus.Playing;
+        StartAudioFromCurrentPosition();
     }
     public void Pause()
     {
         if (_status == PreviewPlayerStatus.Playing) _position = Position;
         _clock.Reset();
+        ++_audioGeneration;
+        CancelAudioDecode();
+        _audioPlayer.Pause();
         if (_input is not null) _status = PreviewPlayerStatus.Paused;
     }
     public void Stop()
     {
         _clock.Reset();
         _position = TimeSpan.Zero;
+        ++_audioGeneration;
+        CancelAudioDecode();
+        _audioPlayer.Stop();
         _status = _input is null ? PreviewPlayerStatus.NotLoaded : PreviewPlayerStatus.Stopped;
     }
     public void Seek(TimeSpan position)
     {
         _position = ClampPosition(position);
-        if (_status == PreviewPlayerStatus.Playing) _clock.Restart();
+        var resume = _status == PreviewPlayerStatus.Playing;
+        ++_audioGeneration;
+        CancelAudioDecode();
+        _audioPlayer.Stop();
+        if (resume)
+        {
+            _clock.Restart();
+            StartAudioFromCurrentPosition();
+        }
     }
     public void Close()
     {
@@ -129,6 +153,10 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
         _duration = TimeSpan.Zero;
         _input = null;
         _image.Source = null;
+        ++_audioGeneration;
+        CancelAudioDecode();
+        _audioPlayer.Close();
+        DeleteTemporaryAudio();
         _status = PreviewPlayerStatus.NotLoaded;
     }
 
@@ -209,6 +237,77 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
     }
 
     private TimeSpan ClampPosition(TimeSpan value) => value < TimeSpan.Zero ? TimeSpan.Zero : _duration > TimeSpan.Zero && value > _duration ? _duration : value;
+
+    // Video frames are decoded by FFmpeg because Media Foundation can reject
+    // common MP4 codecs.  Decode audio to a standard WAV chunk and let WPF play
+    // that WAV; this keeps audio working without relying on the source codec.
+    private void StartAudioFromCurrentPosition()
+    {
+        if (_input is null) return;
+        var generation = ++_audioGeneration;
+        CancelAudioDecode();
+        _audioCancellation = new CancellationTokenSource();
+        _ = DecodeAndPlayAudioAsync(_input, _position, generation, _audioCancellation.Token);
+    }
+
+    private async Task DecodeAndPlayAudioAsync(string input, TimeSpan position, int generation, CancellationToken cancellationToken)
+    {
+        var audioDirectory = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", "preview-audio");
+        Directory.CreateDirectory(audioDirectory);
+        var output = Path.Combine(audioDirectory, $"preview-{Guid.NewGuid():N}.wav");
+        try
+        {
+            var start = new ProcessStartInfo(_ffmpegPath)
+            {
+                UseShellExecute = false,
+                RedirectStandardError = true,
+                CreateNoWindow = true
+            };
+            start.ArgumentList.Add("-hide_banner"); start.ArgumentList.Add("-loglevel"); start.ArgumentList.Add("error"); start.ArgumentList.Add("-y");
+            start.ArgumentList.Add("-ss"); start.ArgumentList.Add(position.TotalSeconds.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture));
+            start.ArgumentList.Add("-i"); start.ArgumentList.Add(input);
+            start.ArgumentList.Add("-vn"); start.ArgumentList.Add("-ac"); start.ArgumentList.Add("2"); start.ArgumentList.Add("-ar"); start.ArgumentList.Add("48000");
+            start.ArgumentList.Add("-c:a"); start.ArgumentList.Add("pcm_s16le"); start.ArgumentList.Add(output);
+            using var process = Process.Start(start) ?? throw new InvalidOperationException("FFmpeg音声デコーダーを起動できませんでした。");
+            using var registration = cancellationToken.Register(() =>
+            {
+                try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { }
+            });
+            var errorTask = process.StandardError.ReadToEndAsync(cancellationToken);
+            await process.WaitForExitAsync(cancellationToken);
+            var error = await errorTask;
+            if (cancellationToken.IsCancellationRequested || generation != _audioGeneration) return;
+            if (process.ExitCode != 0 || !File.Exists(output))
+                throw new InvalidOperationException(string.IsNullOrWhiteSpace(error) ? "動画音声を取得できませんでした。" : error.Trim());
+
+            _audioPlayer.Stop();
+            DeleteTemporaryAudio();
+            _temporaryAudioPath = output;
+            _audioPlayer.Open(new Uri(output, UriKind.Absolute));
+            _audioPlayer.Volume = _volume;
+            _audioPlayer.Play();
+        }
+        catch (OperationCanceledException) { TryDelete(output); }
+        catch (Exception) { TryDelete(output); }
+    }
+
+    private void CancelAudioDecode()
+    {
+        _audioCancellation?.Cancel();
+        _audioCancellation?.Dispose();
+        _audioCancellation = null;
+    }
+
+    private void DeleteTemporaryAudio()
+    {
+        if (_temporaryAudioPath is not null) TryDelete(_temporaryAudioPath);
+        _temporaryAudioPath = null;
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { if (File.Exists(path)) File.Delete(path); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+    }
 }
 
 public sealed class FatWindow : Window
@@ -238,7 +337,7 @@ public sealed class FatWindow : Window
     private readonly Button _naturalizeButton;
     private readonly Button _shortenButton;
     private readonly Image _previewImage = new() { Stretch = System.Windows.Media.Stretch.Uniform, HorizontalAlignment = HorizontalAlignment.Center, VerticalAlignment = VerticalAlignment.Center };
-    private readonly TextBlock _previewOverlay = new() { Text = "", Foreground = System.Windows.Media.Brushes.White, Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromArgb(170, 0, 0, 0)), TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, FontWeight = FontWeights.SemiBold, Padding = new Thickness(12), Margin = new Thickness(24), Visibility = Visibility.Collapsed };
+    private readonly TextBlock _previewOverlay = new() { Text = "", Foreground = System.Windows.Media.Brushes.White, Background = System.Windows.Media.Brushes.Transparent, TextWrapping = TextWrapping.Wrap, TextAlignment = TextAlignment.Center, FontWeight = FontWeights.SemiBold, Padding = new Thickness(12), Margin = new Thickness(24), Visibility = Visibility.Collapsed };
     private readonly TextBlock _previewStatus = new() { Text = "プレビュー: 未読込", Foreground = System.Windows.Media.Brushes.DimGray };
     private readonly TextBlock _previewPosition = new() { Text = "現在: 00:00.000 / 00:00.000" };
     private readonly TextBlock _currentCaptionLabel = new() { Text = "現在字幕: なし", Foreground = System.Windows.Media.Brushes.DimGray };
@@ -671,6 +770,13 @@ public sealed class FatWindow : Window
         var styleSize = double.TryParse(_style.Size, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out var parsedSize) ? parsedSize : 96;
         _previewOverlay.FontSize = Math.Clamp(styleSize / 3.2, 18, 46);
         _previewOverlay.Foreground = new System.Windows.Media.SolidColorBrush(ParseRgb(_style.TextColor, System.Windows.Media.Colors.White));
+        _previewOverlay.Effect = new System.Windows.Media.Effects.DropShadowEffect
+        {
+            Color = ParseRgb(_style.OutlineColor, System.Windows.Media.Colors.Black),
+            ShadowDepth = 0,
+            BlurRadius = 3,
+            Opacity = 0.9
+        };
         _previewOverlay.Visibility = Visibility.Visible;
     }
 
