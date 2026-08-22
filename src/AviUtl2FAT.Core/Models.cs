@@ -44,6 +44,7 @@ public sealed record FatSettings
     public string Device { get; init; } = "auto";
     public string ComputeType { get; init; } = "auto";
     public string SpeechProfile { get; init; } = "auto";
+    public string SpeechRecoveryMode { get; init; } = "auto";
     public string AudioEnhancement { get; init; } = "auto";
     public string FillerMode { get; init; } = "auto";
     public string CpuLoad { get; init; } = "auto";

@@ -1,9 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from dataclasses import replace
 from pathlib import Path
 from typing import Iterator
 import time
+import tempfile
+import wave
 
 from .errors import AttError
 from .progress import emit
@@ -180,3 +183,37 @@ class FasterWhisperRecognizer:
                 raise AttError("TRANSCRIPTION_FAILED", f"音声認識に失敗しました: {error}") from error
 
         return stream(), getattr(info, "language", self.options.language)
+
+    def recognize_window(self, source_wav: Path, start_seconds: float, end_seconds: float) -> tuple[list[dict[str, object]], str | None]:
+        """Recognize one already-vetted WAV interval without VAD re-segmentation.
+
+        This intentionally creates a short temporary WAV.  It keeps recovery
+        bounded and avoids decoding the original media again.
+        """
+        if end_seconds <= start_seconds:
+            return [], self.options.language
+        with wave.open(str(source_wav), "rb") as source:
+            rate = source.getframerate()
+            start_frame = max(0, min(source.getnframes(), int(start_seconds * rate)))
+            end_frame = max(start_frame, min(source.getnframes(), int(end_seconds * rate)))
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temporary:
+                clip_path = Path(temporary.name)
+            try:
+                with wave.open(str(clip_path), "wb") as output:
+                    output.setparams(source.getparams())
+                    source.setpos(start_frame)
+                    output.writeframes(source.readframes(end_frame - start_frame))
+                # The candidate was selected by energy and conservative VAD
+                # checks, so a second VAD pass could wrongly remove weak speech.
+                recovery = FasterWhisperRecognizer(replace(self.options, vad=False, condition_on_previous_text=False))
+                stream, language = recovery.recognize(clip_path, 0)
+                values = []
+                for item in stream:
+                    item["start"] = round(float(item["start"]) + start_seconds, 3)
+                    item["end"] = round(float(item["end"]) + start_seconds, 3)
+                    item["segment_start"] = round(float(item["segment_start"]) + start_seconds, 3)
+                    item["segment_end"] = round(float(item["segment_end"]) + start_seconds, 3)
+                    values.append(item)
+                return values, language
+            finally:
+                clip_path.unlink(missing_ok=True)

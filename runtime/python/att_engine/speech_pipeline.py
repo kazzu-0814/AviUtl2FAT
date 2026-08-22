@@ -89,7 +89,12 @@ class TranscriptPostProcessor:
                 end = min(end, duration)
                 if end <= start: continue
             # VAD/no-speech guard: don't create subtitles from likely silence.
-            if float(item.get("no_speech_probability", 0.0) or 0.0) >= 0.85 and len(text) < 8:
+            # Keep a short but high-confidence utterance (for example "はい"):
+            # a no-speech score alone is not enough evidence to delete it.
+            no_speech = float(item.get("no_speech_probability", 0.0) or 0.0)
+            average_logprob = item.get("avg_logprob")
+            weak_logprob = average_logprob is None or float(average_logprob) < -1.2
+            if no_speech >= 0.85 and len(text) < 8 and weak_logprob:
                 continue
             if text and text == previous and end - start < 3.0:
                 continue

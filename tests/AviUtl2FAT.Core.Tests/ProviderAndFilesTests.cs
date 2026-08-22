@@ -6,6 +6,41 @@ namespace AviUtl2FAT.Core.Tests;
 public sealed class ProviderAndFilesTests
 {
     [Fact]
+    public async Task Draft_round_trip_preserves_caption_original_text_style_and_media_metadata()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"fat-draft-{Guid.NewGuid():N}.fatdraft");
+        try
+        {
+            var caption = new FATCaption("caption-1", 1.25, 3.75, "元の音声", "編集済み字幕", "passthrough", null, 0.8, true, "ja", "ja");
+            var draft = FatDraft.Create("C:\\media\\sample.mp4", 120, 59.94, [caption], AviUtl2TextStyle.Default,
+                [[caption]], new Dictionary<string, string> { ["caption-1"] = "split-from-root" });
+            await FatDraftStore.SaveAsync(path, draft, CancellationToken.None);
+            var loaded = await FatDraftStore.LoadAsync(path, CancellationToken.None);
+            Assert.Equal("C:\\media\\sample.mp4", loaded.MediaPath);
+            Assert.Equal(120, loaded.DurationSeconds);
+            Assert.Equal(59.94, loaded.FramesPerSecond);
+            var restored = Assert.Single(loaded.Captions);
+            Assert.Equal("元の音声", restored.OriginalTranscript);
+            Assert.Equal("編集済み字幕", restored.Text);
+            Assert.Equal("split-from-root", loaded.SplitMetadata!["caption-1"]);
+            Assert.Equal(AviUtl2TextStyle.Default, loaded.Style);
+        }
+        finally { File.Delete(path); File.Delete(path + ".tmp"); }
+    }
+
+    [Fact]
+    public async Task Draft_store_rejects_corrupt_or_incomplete_files_without_treating_them_as_valid()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"fat-draft-{Guid.NewGuid():N}.fatdraft");
+        try
+        {
+            await File.WriteAllTextAsync(path, "{ invalid", new System.Text.UTF8Encoding(false));
+            var error = await Assert.ThrowsAsync<FatException>(() => FatDraftStore.LoadAsync(path, CancellationToken.None));
+            Assert.Equal("FAT_DRAFT_INVALID", error.Code);
+        }
+        finally { File.Delete(path); }
+    }
+    [Fact]
     public void Shortcut_manager_defaults_to_ctrl_space_and_does_not_match_plain_space()
     {
         var shortcuts = new ShortcutManager();

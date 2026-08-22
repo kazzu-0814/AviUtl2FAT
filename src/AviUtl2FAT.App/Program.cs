@@ -387,6 +387,7 @@ public sealed class FatWindow : Window
     private readonly ComboBox _recognitionLanguage = LanguageSelector("auto");
     private readonly ComboBox _outputLanguage = LanguageSelector("ja", includeAuto: false);
     private readonly ComboBox _recognitionProfile = RecognitionProfileSelector();
+    private readonly ComboBox _speechRecovery = SpeechRecoverySelector();
     private readonly ComboBox _aiProvider = AiSelector();
     private readonly TextBlock _aiState = new() { Text = "今回使用するAI: AIなし（高速）" };
     private readonly ObservableCollection<CaptionRow> _captions = [];
@@ -426,6 +427,8 @@ public sealed class FatWindow : Window
     private readonly string _aiSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
     private readonly string _previewSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "preview-settings.json");
     private readonly string _shortcutSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "shortcut-settings.json");
+    private readonly string _autosaveDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "autosave");
+    private readonly DispatcherTimer _draftAutosaveTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private string? _input;
     private bool _isRecognizing;
     private CancellationTokenSource? _recognitionCancellation;
@@ -442,6 +445,9 @@ public sealed class FatWindow : Window
     private DateTimeOffset _suspendAutoFollowUntil = DateTimeOffset.MinValue;
     private ShortcutSettings _shortcutSettings = ShortcutSettings.Default;
     private ShortcutManager _shortcutManager = new();
+    private double _draftDurationSeconds;
+    private double _draftFramesPerSecond = 30;
+    private bool _draftDirty;
 
     public FatWindow()
     {
@@ -485,12 +491,15 @@ public sealed class FatWindow : Window
         AddButton(primaryActions, "動画を選択", (_, _) => ChooseMedia());
         _recognizeButton = AddButton(primaryActions, "字幕を作成", async (_, _) => await ToggleRecognitionAsync());
         _recognizeButton.Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(37, 99, 235)); _recognizeButton.Foreground = System.Windows.Media.Brushes.White;
+        AddButton(primaryActions, "作業を保存", async (_, _) => await SaveDraftAsAsync());
+        AddButton(primaryActions, "作業を開く", async (_, _) => await OpenDraftAsync());
         home.Children.Add(primaryActions);
         var advanced = new Expander { Header = "詳細設定（通常は自動のままで大丈夫です）", Margin = new Thickness(0, 8, 0, 0) };
         var details = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
         details.Children.Add(new TextBlock { Text = "認識言語:", VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_recognitionLanguage);
         details.Children.Add(new TextBlock { Text = "字幕言語:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_outputLanguage);
         details.Children.Add(new TextBlock { Text = "音声認識:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_recognitionProfile);
+        details.Children.Add(new TextBlock { Text = "認識漏れ補正:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_speechRecovery);
         advanced.Content = details; home.Children.Add(advanced); _advancedSettings = advanced;
 
         var previewPanel = CreatePreviewPanel();
@@ -570,6 +579,7 @@ public sealed class FatWindow : Window
         splitButton.ToolTip = "編集欄で文字を選択してから押すと、選択文字を独立した字幕として分割します。文字選択がない場合は行全体を自動分割します。";
         AddButton(inspector, "選択字幕を統合", (_, _) => MergeSelectedCaptions());
         AddButton(inspector, "元に戻す", (_, _) => Undo());
+        AddButton(inspector, "一時 .object を保存", async (_, _) => await ExportDraftObjectAsync());
         inspector.Children.Add(new Separator { Margin = new Thickness(0, 12, 0, 12) });
         inspector.Children.Add(new TextBlock { Text = "出力", FontSize = 18, FontWeight = FontWeights.SemiBold });
         AddButton(inspector, "AviUtl2へ出力", async (_, _) => await ExportAsync()).FontWeight = FontWeights.SemiBold;
@@ -591,8 +601,11 @@ public sealed class FatWindow : Window
         LoadPreviewSettings();
         LoadShortcutSettings();
         ConfigurePreviewEvents();
+        _draftAutosaveTimer.Tick += async (_, _) => await AutosaveDraftAsync();
+        _draftAutosaveTimer.Start();
         SelectNavigation("ホーム");
-        Closed += (_, _) => { SavePreviewSettings(); SaveShortcutSettings(); _previewTimer.Stop(); _previewBackend.Close(); _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
+        Loaded += async (_, _) => await PromptDraftRecoveryAsync();
+        Closed += (_, _) => { SavePreviewSettings(); SaveShortcutSettings(); _draftAutosaveTimer.Stop(); _previewTimer.Stop(); _previewBackend.Close(); _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
     }
 
     private Border CreatePreviewPanel()
@@ -742,6 +755,7 @@ public sealed class FatWindow : Window
             await _previewBackend.OpenAsync(path);
             _previewStatus.Text = "プレビュー: フレームを読み込み中";
             _previewFormat.Text = $"表示: {DescribeAspectRatio(_previewBackend.AspectRatio)}";
+            _draftDurationSeconds = _previewBackend.Duration.TotalSeconds;
             _seekBar.Value = 0;
             UpdatePlaybackSync();
             _ = RefreshPreviewFrameAsync(force: true);
@@ -1183,11 +1197,12 @@ public sealed class FatWindow : Window
     private static string GetCurrentVersion()
     {
         var version = typeof(FatWindow).Assembly.GetName().Version;
-        return version is null ? "1.0.0" : version.ToString(3);
+        return version is null ? "1.1" : version.Build == 0 ? $"{version.Major}.{version.Minor}" : version.ToString(3);
     }
 
     private static ComboBox LanguageSelector(string selected, bool includeAuto = true) { var box = new ComboBox { Width = 130, Margin = new Thickness(0, 0, 0, 8) }; if (includeAuto) box.Items.Add(new ComboBoxItem { Content = "自動判定", Tag = "auto" }); box.Items.Add(new ComboBoxItem { Content = "日本語", Tag = "ja" }); box.Items.Add(new ComboBoxItem { Content = "English", Tag = "en" }); box.SelectedItem = box.Items.Cast<ComboBoxItem>().First(x => (string)x.Tag == selected); return box; }
     private static ComboBox RecognitionProfileSelector() { var box = new ComboBox { Width = 120, Margin = new Thickness(0, 0, 0, 8) }; foreach (var item in new[] { ("自動", "auto"), ("高速", "low"), ("標準", "standard"), ("高精度", "high") }) box.Items.Add(new ComboBoxItem { Content = item.Item1, Tag = item.Item2 }); box.SelectedIndex = 0; return box; }
+    private static ComboBox SpeechRecoverySelector() { var box = new ComboBox { Width = 150, Margin = new Thickness(0, 0, 0, 8) }; foreach (var item in new[] { ("自動（推奨）", "auto"), ("発話を優先", "speech_priority"), ("無効", "none") }) box.Items.Add(new ComboBoxItem { Content = item.Item1, Tag = item.Item2 }); box.SelectedIndex = 0; return box; }
     private static ComboBox AiSelector() { var box = new ComboBox { Width = 180, Margin = new Thickness(0, 0, 0, 8) }; foreach (var item in new[] { ("自動", "auto"), ("AIなし（高速）", "rule"), ("Gemma 4 E2B", "gemma:gemma-4-e2b-it"), ("Gemma 4 E4B", "gemma:gemma-4-e4b-it"), ("Gemma 4 12B", "gemma:gemma-4-12b-it"), ("Gemma 4 26B A4B", "gemma:gemma-4-26b-a4b-it"), ("OpenAI Codex", "codex"), ("Anthropic Claude Code", "claude-code") }) box.Items.Add(new ComboBoxItem { Content = item.Item1, Tag = item.Item2 }); box.SelectedIndex = 0; return box; }
     private static ComboBox CodexBackendSelectorBox()
     {
@@ -1221,7 +1236,7 @@ public sealed class FatWindow : Window
         panel.Children.Add(button);
         return button;
     }
-    private async void ChooseMedia() { var dialog = new OpenFileDialog { Filter = "動画・音声|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.m4a;*.wav;*.flac|すべてのファイル|*.*" }; if (dialog.ShowDialog(this) == true) { _input = dialog.FileName; _media.Text = $"動画素材: {Path.GetFileName(_input)}"; await OpenPreviewMediaAsync(_input); } }
+    private async void ChooseMedia() { var dialog = new OpenFileDialog { Filter = "動画・音声|*.mp4;*.mov;*.mkv;*.avi;*.webm;*.mp3;*.m4a;*.wav;*.flac|すべてのファイル|*.*" }; if (dialog.ShowDialog(this) == true) { _input = dialog.FileName; _media.Text = $"動画素材: {Path.GetFileName(_input)}"; await OpenPreviewMediaAsync(_input); ScheduleDraftAutosave(); } }
     private async Task ToggleRecognitionAsync()
     {
         if (_isRecognizing)
@@ -1248,7 +1263,7 @@ public sealed class FatWindow : Window
             _progress.Value = 0; _status.Text = "Starting worker...";
             var output = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", $"{Guid.NewGuid():N}.att.json");
             var recognitionLanguage = SelectedLanguage(_recognitionLanguage); var outputLanguage = SelectedLanguage(_outputLanguage);
-            await RunWorkerAsync(new RecognitionRequest(_input, output, new FatSettings { Version = CurrentVersion, Language = recognitionLanguage, RecognitionLanguage = recognitionLanguage, CaptionOutputLanguage = outputLanguage, SpeechProfile = (string)((ComboBoxItem)_recognitionProfile.SelectedItem).Tag }), p => { _status.Text = p.Message; if (p.Value is not null) _progress.Value = Math.Clamp(p.Value.Value, 0, 100); }, _recognitionCancellation.Token);
+            await RunWorkerAsync(new RecognitionRequest(_input, output, new FatSettings { Version = CurrentVersion, Language = recognitionLanguage, RecognitionLanguage = recognitionLanguage, CaptionOutputLanguage = outputLanguage, SpeechProfile = (string)((ComboBoxItem)_recognitionProfile.SelectedItem).Tag, SpeechRecoveryMode = (string)((ComboBoxItem)_speechRecovery.SelectedItem).Tag }), p => { _status.Text = p.Message; if (p.Value is not null) _progress.Value = Math.Clamp(p.Value.Value, 0, 100); }, _recognitionCancellation.Token);
             var transcript = await FatFiles.ReadAttTranscriptAsync(output, CancellationToken.None);
             var response = await _providers.GetRequired("passthrough").GenerateCaptionsAsync(new CaptionGenerationRequest(transcript), CancellationToken.None);
             _lastGenerated = response.Captions; Load(response.Captions); _progress.Value = 100; _status.Text = $"完了: {_captions.Count} 件の字幕を編集できます。";
@@ -1416,6 +1431,98 @@ public sealed class FatWindow : Window
     private static bool HasPythonEngine(string runtime) =>
         (File.Exists(Path.Combine(runtime, "python-runtime", "python.exe")) || File.Exists(Path.Combine(runtime, "python-env", "Scripts", "python.exe"))) &&
         File.Exists(Path.Combine(runtime, "python", "fat_worker.py"));
+
+    private FatDraft CreateDraft() => FatDraft.Create(_input, _draftDurationSeconds, _draftFramesPerSecond,
+        _captions.Select(row => row.ToCaption()).ToArray(), _style, _undo.Reverse().ToArray());
+
+    private void ScheduleDraftAutosave()
+    {
+        _draftDirty = true;
+        _draftAutosaveTimer.Stop();
+        _draftAutosaveTimer.Start();
+    }
+
+    private async Task AutosaveDraftAsync()
+    {
+        if (!_draftDirty || _captions.Count == 0) return;
+        _draftAutosaveTimer.Stop();
+        try
+        {
+            Directory.CreateDirectory(_autosaveDirectory);
+            await FatDraftStore.SaveAsync(FatDraftStore.AutosavePath(_autosaveDirectory), CreateDraft(), CancellationToken.None);
+            _draftDirty = false;
+        }
+        catch (FatException error) { _status.Text = $"自動保存できませんでした: {error.Message}"; }
+    }
+
+    private async Task SaveDraftAsAsync()
+    {
+        if (_captions.Count == 0) { Error("FAT_DRAFT_EMPTY", "保存する字幕がありません。字幕を作成または作業ファイルを開いてください。"); return; }
+        var dialog = new SaveFileDialog { Filter = "AviUtl2 FAT 作業ファイル|*.fatdraft", FileName = $"FAT_Draft_{DateTime.Now:yyyyMMdd_HHmmss}" };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            await FatDraftStore.SaveAsync(dialog.FileName, CreateDraft(), CancellationToken.None);
+            _draftDirty = false;
+            _status.Text = $"作業を保存しました: {Path.GetFileName(dialog.FileName)}";
+        }
+        catch (FatException error) { Error(error.Code, error.Message); }
+    }
+
+    private async Task OpenDraftAsync()
+    {
+        var dialog = new OpenFileDialog { Filter = "AviUtl2 FAT 作業ファイル|*.fatdraft" };
+        if (dialog.ShowDialog(this) != true) return;
+        await RestoreDraftAsync(dialog.FileName);
+    }
+
+    private async Task PromptDraftRecoveryAsync()
+    {
+        var path = FatDraftStore.AutosavePath(_autosaveDirectory);
+        if (!File.Exists(path)) return;
+        if (MessageBox.Show(this, "前回の作業の自動保存があります。復元しますか？\n\n復元しない場合もファイルは削除せず残します。", Title, MessageBoxButton.YesNo, MessageBoxImage.Question) == MessageBoxResult.Yes)
+            await RestoreDraftAsync(path);
+    }
+
+    private async Task RestoreDraftAsync(string path)
+    {
+        try
+        {
+            var draft = await FatDraftStore.LoadAsync(path, CancellationToken.None);
+            _input = string.IsNullOrWhiteSpace(draft.MediaPath) ? null : draft.MediaPath;
+            _draftDurationSeconds = draft.DurationSeconds;
+            _draftFramesPerSecond = draft.FramesPerSecond;
+            _style = draft.Style ?? AviUtl2TextStyle.Default;
+            _undo.Clear();
+            foreach (var snapshot in draft.UndoSnapshots ?? []) _undo.Push(snapshot);
+            Load(draft.Captions);
+            if (!string.IsNullOrWhiteSpace(_input))
+            {
+                _media.Text = $"動画素材: {Path.GetFileName(_input)}";
+                if (File.Exists(_input)) await OpenPreviewMediaAsync(_input);
+                else _status.Text = "作業を復元しました。元動画が見つからないため、動画を選び直してください。";
+            }
+            else _status.Text = "作業を復元しました。";
+            _draftDirty = false;
+        }
+        catch (FatException error) { Error(error.Code, error.Message); }
+    }
+
+    private async Task ExportDraftObjectAsync()
+    {
+        if (_captions.Count == 0) { Error("FAT_NO_CAPTIONS", "一時 .object に出力する字幕がありません。"); return; }
+        var dialog = new SaveFileDialog { Filter = "AviUtl2用オブジェクト|*.object", FileName = $"Draft_{DateTime.Now:yyyyMMdd_HHmmss}" };
+        if (dialog.ShowDialog(this) != true) return;
+        try
+        {
+            var captions = _captions.Select(row => row.ToCaption()).ToArray();
+            var result = await new AviUtl2MultiObjectExporter(_objectTemplate, _style).ExportAsync(dialog.FileName, captions, _draftFramesPerSecond,
+                new AviUtl2MultiObjectExportOptions(AviUtl2LayerPlacementMode.Auto), CancellationToken.None);
+            _status.Text = $"一時 .object を保存しました: {result.Exported} 件";
+        }
+        catch (FatException error) { Error(error.Code, error.Message); }
+    }
+
     private async Task ExportAsync()
     {
         if (_captions.Count == 0) { Error("FAT_NO_CAPTIONS", "There are no captions to export."); return; }
@@ -1475,7 +1582,11 @@ public sealed class FatWindow : Window
             var row = new CaptionRow(caption);
             row.PropertyChanged += (_, eventArgs) =>
             {
-                if (eventArgs.PropertyName == nameof(CaptionRow.Text) && ReferenceEquals(row, _currentCaption)) UpdatePreviewOverlay();
+                if (eventArgs.PropertyName == nameof(CaptionRow.Text))
+                {
+                    if (ReferenceEquals(row, _currentCaption)) UpdatePreviewOverlay();
+                    ScheduleDraftAutosave();
+                }
             };
             _captions.Add(row);
         }
@@ -1485,6 +1596,7 @@ public sealed class FatWindow : Window
         _textSelectionStart = 0;
         _textSelectionLength = 0;
         UpdatePlaybackSync();
+        ScheduleDraftAutosave();
     }
     private void Error(string code, string message)
     {

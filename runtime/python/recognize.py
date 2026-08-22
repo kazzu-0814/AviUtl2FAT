@@ -13,6 +13,7 @@ from att_engine.media_probe import probe
 from att_engine.cancellation import OperationCancelledError, throw_if_cancelled
 from att_engine.speech_pipeline import TranscriptPostProcessor, build_initial_prompt, select_profile, warning_for
 from att_engine.model_service import validate as validate_model
+from att_engine.speech_recovery import SpeechRecoverySettings, find_candidates, is_recoverable, merge_recovered, recovery_window
 
 
 def parser() -> argparse.ArgumentParser:
@@ -47,6 +48,7 @@ def parser() -> argparse.ArgumentParser:
     value.add_argument("--audio-enhancement", choices=("auto", "none", "weak", "standard"), default="auto")
     value.add_argument("--filler-mode", choices=("keep", "auto", "organize"), default="auto")
     value.add_argument("--dictionary", default="")
+    value.add_argument("--speech-recovery", choices=("none", "auto", "speech_priority"), default="auto")
     return value
 
 
@@ -104,7 +106,33 @@ def main() -> int:
         throw_if_cancelled(cancel_file)
         filler_mode = "keep" if args.filler_mode == "keep" else args.filler_mode
         collected = TranscriptPostProcessor().process(collected, total_seconds, language, filler_mode)
-        for item in collected: item["warning"] = warning_for(item)
+        recovery_settings = SpeechRecoverySettings.select(args.speech_recovery)
+        if recovery_settings.enabled:
+            emit("progress", stage="recovery", value=90, message="長い空白区間の認識漏れを確認しています")
+            candidates = find_candidates(wav_path, collected, total_seconds, recovery_settings)
+            recovered = []
+            recognizer = FasterWhisperRecognizer(options)
+            for index, candidate in enumerate(candidates, start=1):
+                throw_if_cancelled(cancel_file)
+                emit("status", message=f"認識漏れ候補を確認しています ({index}/{len(candidates)})", recovery_candidate={"start": candidate.start, "end": candidate.end, "rms_db": candidate.rms_db, "active_ratio": candidate.active_ratio})
+                window_start, window_end = recovery_window(candidate, total_seconds, recovery_settings)
+                values, _ = recognizer.recognize_window(wav_path, window_start, window_end)
+                # Values have already been shifted into the original media's
+                # time axis, so do not clamp them to the short clip duration.
+                cleaned = TranscriptPostProcessor().process(values, 0, language, filler_mode)
+                # Padding provides context to Whisper, but recovered captions
+                # must originate inside the original gap.  This prevents the
+                # pass from re-emitting neighbouring accepted speech.
+                recovered.extend(item for item in cleaned
+                                 if candidate.start <= (float(item["start"]) + float(item["end"])) / 2 <= candidate.end
+                                 and is_recoverable(item, recovery_settings))
+            collected = merge_recovered(collected, recovered)
+            emit("progress", stage="recovery", value=96, message=f"認識漏れ補正を完了しました（追加 {len(recovered)} 件）")
+        for index, item in enumerate(collected, start=1):
+            # A clip recognizer starts segment ids at one.  Normalize only the
+            # output identifiers after merging; timestamps remain untouched.
+            item["id"] = index
+            item["warning"] = warning_for(item)
         result = writer.build_result(args.input.name, language, model, collected, total_seconds, device, compute_type)
         emit("progress", stage="save", value=98, message="出力を保存しています")
         writer.write_json(args.output, result)

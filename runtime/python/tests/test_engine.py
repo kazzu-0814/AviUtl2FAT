@@ -2,6 +2,9 @@ import io
 import json
 import tempfile
 import unittest
+import math
+import struct
+import wave
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch, Mock
@@ -12,6 +15,7 @@ from att_engine.output_writer import OutputWriter, seconds_to_frame, timestamp
 from att_engine.progress import emit
 from att_engine.recognizer import FasterWhisperRecognizer, RecognitionOptions, clean_text
 from att_engine.speech_pipeline import TranscriptPostProcessor, build_initial_prompt, select_profile, warning_for
+from att_engine.speech_recovery import SpeechRecoverySettings, find_candidates, is_recoverable, merge_recovered, recovery_window
 
 
 class FakeWord:
@@ -114,6 +118,30 @@ class EngineTests(unittest.TestCase):
     def test_low_confidence_and_long_caption_warn(self):
         self.assertIn("精度", warning_for({"text": "本文", "confidence": 0.2}))
         self.assertIn("文字", warning_for({"text": "a" * 43}))
+
+    def test_speech_recovery_requires_energy_and_voice_activity_and_preserves_existing_gaps(self):
+        with tempfile.TemporaryDirectory() as folder:
+            wav_path = Path(folder) / "audio.wav"
+            rate = 16000
+            # 3 seconds of a voiced sine wave: it is a recovery candidate only
+            # because both energy and the conservative activity proxy agree.
+            samples = [int(2500 * math.sin(2 * math.pi * 220 * index / rate)) for index in range(rate * 3)]
+            with wave.open(str(wav_path), "wb") as output:
+                output.setnchannels(1); output.setsampwidth(2); output.setframerate(rate)
+                output.writeframes(struct.pack("<" + "h" * len(samples), *samples))
+            candidates = find_candidates(wav_path, [], 3.0, SpeechRecoverySettings())
+            self.assertEqual(1, len(candidates))
+            self.assertEqual((0.0, 3.0), (candidates[0].start, candidates[0].end))
+            self.assertEqual((0.0, 3.0), recovery_window(candidates[0], 3.0, SpeechRecoverySettings()))
+            original = [{"text": "先", "start": 0.0, "end": 0.5}, {"text": "後", "start": 4.0, "end": 4.5}]
+            merged = merge_recovered(original, [{"text": "補足", "start": 2.0, "end": 2.4, "avg_logprob": -0.2, "no_speech_probability": 0.1}])
+            self.assertEqual([0.0, 2.0, 4.0], [item["start"] for item in merged])
+
+    def test_speech_recovery_rejects_likely_silence_and_hallucinated_closing(self):
+        settings = SpeechRecoverySettings()
+        self.assertFalse(is_recoverable({"text": "", "avg_logprob": -0.1, "no_speech_probability": 0.0}, settings))
+        self.assertFalse(is_recoverable({"text": "ご視聴ありがとうございました。", "avg_logprob": -0.1, "no_speech_probability": 0.0}, settings))
+        self.assertFalse(is_recoverable({"text": "候補", "avg_logprob": -2.0, "no_speech_probability": 0.0}, settings))
 
 
 if __name__ == "__main__": unittest.main()

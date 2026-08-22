@@ -100,7 +100,7 @@ static async Task RunRecognitionAsync(RecognitionRequest request, string? reques
             model = request.Settings.RecognitionModel, language = request.Settings.Language,
             device = request.Settings.Device, compute_type = request.Settings.ComputeType,
             profile = request.Settings.SpeechProfile, audio_enhancement = request.Settings.AudioEnhancement,
-            filler_mode = request.Settings.FillerMode, dictionary = string.Join(",", request.Settings.RecognitionDictionary),
+            filler_mode = request.Settings.FillerMode, speech_recovery = request.Settings.SpeechRecoveryMode, dictionary = string.Join(",", request.Settings.RecognitionDictionary),
             fps = request.Settings.Fps, ffmpeg, ffprobe, model_dir = models, session_dir = session
         }
     };
