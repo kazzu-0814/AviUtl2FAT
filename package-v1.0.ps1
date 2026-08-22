@@ -3,6 +3,12 @@ param(
     [switch]$BuildInstaller,
     [switch]$SkipPortableArchive,
     [switch]$Clean,
+    # Optional trusted code-signing certificate.  Do not use a self-signed
+    # development certificate for public releases: Smart App Control requires
+    # a certificate issued by a trusted provider.
+    [string]$CertificateThumbprint,
+    [string]$TimestampUrl = 'http://timestamp.digicert.com',
+    [string]$SignToolPath,
     [ValidatePattern('^\d+\.\d+\.\d+$')]
     [string]$Version = '1.1.0'
 )
@@ -15,6 +21,51 @@ $version = $Version
 $dist = Join-Path $root "dist\AviUtl2FAT-$version-x64"
 $payload = Join-Path $dist 'Plugin\AviUtl2FAT'
 $app = Join-Path $payload 'FAT'
+$script:signTool = $null
+$script:certificateStoreArgument = @()
+$script:certificateThumbprint = $null
+$script:timestampUrl = $TimestampUrl
+
+function Initialize-CodeSigning([string]$RequestedThumbprint, [string]$RequestedTimestampUrl, [string]$RequestedSignToolPath) {
+    if ([string]::IsNullOrWhiteSpace($RequestedThumbprint)) { return }
+
+    $script:certificateThumbprint = ($RequestedThumbprint -replace '[^0-9A-Fa-f]', '').ToUpperInvariant()
+    if ($script:certificateThumbprint.Length -ne 40) {
+        throw 'CertificateThumbprint must be a SHA-1 certificate thumbprint.'
+    }
+
+    $certificate = Get-ChildItem -Path "Cert:\CurrentUser\My\$script:certificateThumbprint" -ErrorAction SilentlyContinue
+    if (-not $certificate) {
+        $certificate = Get-ChildItem -Path "Cert:\LocalMachine\My\$script:certificateThumbprint" -ErrorAction SilentlyContinue
+        if ($certificate) { $script:certificateStoreArgument = @('/sm') }
+    }
+    if (-not $certificate -or -not $certificate.HasPrivateKey) {
+        throw 'The requested code-signing certificate with a private key was not found in CurrentUser\\My or LocalMachine\\My.'
+    }
+    if ([string]::IsNullOrWhiteSpace($RequestedTimestampUrl)) {
+        throw 'TimestampUrl is required for a signed public release.'
+    }
+    $script:timestampUrl = $RequestedTimestampUrl
+
+    $candidates = @(
+        $RequestedSignToolPath,
+        (Get-Command signtool.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
+        'C:\Program Files (x86)\Windows Kits\10\bin\x64\signtool.exe',
+        'C:\Program Files (x86)\Windows Kits\10\bin\10.0.26100.0\x64\signtool.exe'
+    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) }
+    $script:signTool = $candidates | Select-Object -First 1
+    if (-not $script:signTool) {
+        throw 'signtool.exe was not found. Install the Windows SDK signing tools or pass -SignToolPath.'
+    }
+}
+
+function Sign-PackageBinary([string]$Path) {
+    if (-not $script:signTool) { return }
+    & $script:signTool sign /fd SHA256 /sha1 $script:certificateThumbprint @script:certificateStoreArgument /tr $script:timestampUrl /td SHA256 $Path
+    if ($LASTEXITCODE -ne 0) { throw "Code signing failed: $Path" }
+    $signature = Get-AuthenticodeSignature -LiteralPath $Path
+    if ($signature.Status -ne 'Valid') { throw "Signature validation failed for ${Path}: $($signature.Status)" }
+}
 
 function Remove-PackageOutput([string]$Path) {
     # robocopy handles long paths more reliably than Copy-Item/Remove-Item.
@@ -35,6 +86,10 @@ function Remove-PackageOutput([string]$Path) {
 
 if (-not (Test-Path -LiteralPath $dotnet)) { throw ".NET SDK was not found: $dotnet" }
 if (-not (Test-Path -LiteralPath $cargo)) { throw "Rust cargo.exe was not found: $cargo" }
+$requestedThumbprint = [string]$PSBoundParameters['CertificateThumbprint']
+$requestedTimestampUrl = if ($PSBoundParameters.ContainsKey('TimestampUrl')) { [string]$PSBoundParameters['TimestampUrl'] } else { $TimestampUrl }
+$requestedSignToolPath = [string]$PSBoundParameters['SignToolPath']
+Initialize-CodeSigning -RequestedThumbprint $requestedThumbprint -RequestedTimestampUrl $requestedTimestampUrl -RequestedSignToolPath $requestedSignToolPath
 if (Test-Path -LiteralPath $dist) {
     if (-not $Clean) {
         throw "The package output already exists and was not changed: $dist`nChoose a new -Version (recommended), or explicitly pass -Clean to rebuild that exact version."
@@ -73,13 +128,34 @@ $required = @('AviUtl2FAT.aux2', 'FAT\AviUtl2FAT.App.exe', 'FAT\AviUtl2FAT.Worke
 if ($BuildPortablePython) { $required += 'FAT\runtime\python-runtime\python.exe' }
 foreach ($relative in $required) { if (-not (Test-Path -LiteralPath (Join-Path $payload $relative))) { throw "Package validation failed: $relative" } }
 
+if ($script:signTool) {
+    # Smart App Control evaluates the executable code that FAT loads, not just
+    # the outer installer. Sign all PE payload binaries before archiving.
+    Get-ChildItem -LiteralPath $payload -Recurse -File |
+        Where-Object { $_.Extension -in '.exe', '.dll', '.pyd', '.aux2' } |
+        ForEach-Object { Sign-PackageBinary $_.FullName }
+}
+
 if (-not $SkipPortableArchive) {
     Compress-Archive -Path (Join-Path $dist '*') -DestinationPath (Join-Path $root "dist\AviUtl2FAT-$version-x64-portable.zip") -Force
 }
 if ($BuildInstaller) {
     $iscc = @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe', (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
     if (-not $iscc) { throw 'Inno Setup 6 is required to build the installer. Install it, then run this command again.' }
-    & $iscc (Join-Path $root 'release\AviUtl2FAT.iss') "/DSourcePayload=$payload" "/DAppVersion=$version"
+    $innoArguments = @((Join-Path $root 'release\AviUtl2FAT.iss'), "/DSourcePayload=$payload", "/DAppVersion=$version")
+    if ($script:signTool) {
+        # Inno Setup signs both the outer setup executable and its generated
+        # uninstaller through this named SignTool definition.
+        $innoSignCommand = ('"{0}" sign /fd SHA256 /sha1 {1} {2} /tr {3} /td SHA256 $f' -f $script:signTool, $script:certificateThumbprint, ($script:certificateStoreArgument -join ' '), $script:timestampUrl)
+        $innoArguments += '/DSignToolName=fatcodesign'
+        $innoArguments += "/Sfatcodesign=$innoSignCommand"
+    }
+    & $iscc @innoArguments
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup build failed.' }
+    if ($script:signTool) {
+        $installer = Join-Path $root "dist\AviUtl2FAT-Setup-$version-x64.exe"
+        $installerSignature = Get-AuthenticodeSignature -LiteralPath $installer
+        if ($installerSignature.Status -ne 'Valid') { throw "Installer signature validation failed: $($installerSignature.Status)" }
+    }
 }
-[pscustomobject]@{ Product = 'AviUtl2 FAT'; Version = $version; Payload = $payload; SelfContainedDotNet = $true; PortablePython = [bool]$BuildPortablePython; ModelsBundled = $false } | ConvertTo-Json
+[pscustomobject]@{ Product = 'AviUtl2 FAT'; Version = $version; Payload = $payload; SelfContainedDotNet = $true; PortablePython = [bool]$BuildPortablePython; ModelsBundled = $false; CodeSigned = [bool]$script:signTool } | ConvertTo-Json

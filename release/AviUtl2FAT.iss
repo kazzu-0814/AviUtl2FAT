@@ -16,6 +16,9 @@ DefaultDirName={code:GetFatPluginDirectory}
 DisableProgramGroupPage=yes
 OutputDir=..\dist
 OutputBaseFilename=AviUtl2FAT-Setup-{#AppVersion}-x64
+#ifdef SignToolName
+SignTool={#SignToolName}
+#endif
 Compression=lzma2
 SolidCompression=yes
 ArchitecturesAllowed=x64compatible
