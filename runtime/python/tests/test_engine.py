@@ -143,5 +143,10 @@ class EngineTests(unittest.TestCase):
         self.assertFalse(is_recoverable({"text": "ご視聴ありがとうございました。", "avg_logprob": -0.1, "no_speech_probability": 0.0}, settings))
         self.assertFalse(is_recoverable({"text": "候補", "avg_logprob": -2.0, "no_speech_probability": 0.0}, settings))
 
+    def test_speech_recovery_mode_has_a_safe_enabled_property(self):
+        self.assertTrue(SpeechRecoverySettings.select("auto").enabled)
+        self.assertTrue(SpeechRecoverySettings.select("speech_priority").enabled)
+        self.assertFalse(SpeechRecoverySettings.select("none").enabled)
+
 
 if __name__ == "__main__": unittest.main()

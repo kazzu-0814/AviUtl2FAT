@@ -24,6 +24,16 @@ class SpeechRecoverySettings:
     minimum_active_fraction: float = 0.18
     minimum_log_probability: float = -1.2
 
+    @property
+    def enabled(self) -> bool:
+        """Whether the bounded recovery pass is permitted for this profile.
+
+        `mode=none` must be a true opt-out, even if a settings object was
+        reconstructed from an older configuration that does not carry an
+        explicit `enabled` field.
+        """
+        return self.mode != "none" and self.maximum_candidates > 0
+
     @staticmethod
     def select(mode: str | None) -> "SpeechRecoverySettings":
         value = (mode or "auto").lower()

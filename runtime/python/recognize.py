@@ -114,7 +114,7 @@ def main() -> int:
             recognizer = FasterWhisperRecognizer(options)
             for index, candidate in enumerate(candidates, start=1):
                 throw_if_cancelled(cancel_file)
-                emit("status", message=f"認識漏れ候補を確認しています ({index}/{len(candidates)})", recovery_candidate={"start": candidate.start, "end": candidate.end, "rms_db": candidate.rms_db, "active_ratio": candidate.active_ratio})
+                emit("status", message=f"認識漏れ候補を確認しています ({index}/{len(candidates)})", recovery_candidate={"start": candidate.start, "end": candidate.end, "rms_db": candidate.energy_db, "active_ratio": candidate.active_fraction})
                 window_start, window_end = recovery_window(candidate, total_seconds, recovery_settings)
                 values, _ = recognizer.recognize_window(wav_path, window_start, window_end)
                 # Values have already been shifted into the original media's
