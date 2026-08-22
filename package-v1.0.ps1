@@ -21,6 +21,7 @@ $version = $Version
 $dist = Join-Path $root "dist\AviUtl2FAT-$version-x64"
 $payload = Join-Path $dist 'Plugin\AviUtl2FAT'
 $app = Join-Path $payload 'FAT'
+$workerPublish = Join-Path $dist '_worker-publish'
 $script:signTool = $null
 $script:certificateStoreArgument = @()
 $script:certificateThumbprint = $null
@@ -100,10 +101,19 @@ New-Item -ItemType Directory -Force -Path $app | Out-Null
 
 # The App includes its isolated Worker. self-contained avoids a .NET Desktop
 # Runtime prerequisite on the recipient's computer.
-& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.App\AviUtl2FAT.App.csproj') -c Release -r win-x64 --self-contained true -p:Version=$version -p:AssemblyVersion="$version.0" -p:FileVersion="$version.0" -p:InformationalVersion=$version -p:BuildProjectReferences=false -p:SkipFatWorkerDeployment=true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o $app
+& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.App\AviUtl2FAT.App.csproj') -c Release -r win-x64 --self-contained true -p:Version=$version -p:AssemblyVersion="$version.0" -p:FileVersion="$version.0" -p:InformationalVersion=$version -p:SkipFatWorkerDeployment=true -p:PublishSingleFile=false -p:DebugType=None -p:DebugSymbols=false -o $app
 if ($LASTEXITCODE -ne 0) { throw 'Self-contained App publish failed.' }
-& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.Worker\AviUtl2FAT.Worker.csproj') -c Release -r win-x64 --self-contained true -p:Version=$version -p:AssemblyVersion="$version.0" -p:FileVersion="$version.0" -p:InformationalVersion=$version -p:DebugType=None -p:DebugSymbols=false -o $app
+& $dotnet publish (Join-Path $root 'src\AviUtl2FAT.Worker\AviUtl2FAT.Worker.csproj') -c Release -r win-x64 --self-contained true -p:Version=$version -p:AssemblyVersion="$version.0" -p:FileVersion="$version.0" -p:InformationalVersion=$version -p:DebugType=None -p:DebugSymbols=false -o $workerPublish
 if ($LASTEXITCODE -ne 0) { throw 'Self-contained Worker publish failed.' }
+
+# Publish the Worker into its own directory. Publishing it directly beside the
+# App used to overwrite AviUtl2FAT.Core.dll with a stale Worker dependency,
+# causing the App to crash before it could show its window.
+foreach ($workerLaunchFile in @('AviUtl2FAT.Worker.exe', 'AviUtl2FAT.Worker.dll', 'AviUtl2FAT.Worker.deps.json', 'AviUtl2FAT.Worker.runtimeconfig.json')) {
+    $source = Join-Path $workerPublish $workerLaunchFile
+    if (-not (Test-Path -LiteralPath $source)) { throw "Worker publish validation failed: $workerLaunchFile" }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $app $workerLaunchFile) -Force
+}
 & $cargo build --manifest-path (Join-Path $root 'plugin\Cargo.toml') --release
 if ($LASTEXITCODE -ne 0) { throw 'Rust plugin release build failed.' }
 Copy-Item -LiteralPath (Join-Path $root 'plugin\target\release\aviutl2_fat_plugin.dll') -Destination (Join-Path $payload 'AviUtl2FAT.aux2') -Force
@@ -124,9 +134,16 @@ if ($BuildPortablePython) {
 foreach ($document in @('README.md', 'QUICKSTART.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RELEASE_CHECKLIST.md', 'release\FFMPEG_PROVENANCE.md', 'release\licenses\GPL-3.0.txt')) {
     Copy-Item -LiteralPath (Join-Path $root $document) -Destination $dist -Force
 }
-$required = @('AviUtl2FAT.aux2', 'FAT\AviUtl2FAT.App.exe', 'FAT\AviUtl2FAT.Worker.exe', 'FAT\runtime\python\fat_worker.py', 'FAT\runtime\ffmpeg\ffmpeg.exe', 'FAT\runtime\ffmpeg\ffprobe.exe', 'FAT\licenses\GPL-3.0.txt', 'FAT\FFMPEG_PROVENANCE.md')
+$required = @('AviUtl2FAT.aux2', 'FAT\AviUtl2FAT.App.exe', 'FAT\AviUtl2FAT.App.dll', 'FAT\AviUtl2FAT.Core.dll', 'FAT\AviUtl2FAT.Worker.exe', 'FAT\AviUtl2FAT.Worker.dll', 'FAT\runtime\python\fat_worker.py', 'FAT\runtime\ffmpeg\ffmpeg.exe', 'FAT\runtime\ffmpeg\ffprobe.exe', 'FAT\licenses\GPL-3.0.txt', 'FAT\FFMPEG_PROVENANCE.md')
 if ($BuildPortablePython) { $required += 'FAT\runtime\python-runtime\python.exe' }
 foreach ($relative in $required) { if (-not (Test-Path -LiteralPath (Join-Path $payload $relative))) { throw "Package validation failed: $relative" } }
+
+$expectedAssemblyVersion = [Version]::Parse("$version.0")
+$appAssembly = [System.Reflection.AssemblyName]::GetAssemblyName((Join-Path $app 'AviUtl2FAT.App.dll'))
+$coreAssembly = [System.Reflection.AssemblyName]::GetAssemblyName((Join-Path $app 'AviUtl2FAT.Core.dll'))
+if ($appAssembly.Version -ne $expectedAssemblyVersion -or $coreAssembly.Version -ne $expectedAssemblyVersion) {
+    throw "Package assembly validation failed: App=$($appAssembly.Version), Core=$($coreAssembly.Version), expected=$expectedAssemblyVersion"
+}
 
 if ($script:signTool) {
     # Smart App Control evaluates the executable code that FAT loads, not just
