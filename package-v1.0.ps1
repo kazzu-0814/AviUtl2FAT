@@ -10,7 +10,7 @@ param(
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
     [string]$SignToolPath,
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '1.1.0'
+    [string]$Version = '1.1.4'
 )
 
 $ErrorActionPreference = 'Stop'

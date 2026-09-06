@@ -20,6 +20,8 @@ if hasattr(sys.stdout, "reconfigure"):
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 from fat_engine.model_manager import ModelManager
+from att_engine.progress import set_callback
+from att_engine.recognition_service import RecognitionService
 
 
 def emit(message_type: str, request_id: str | None, payload: object | None = None, error: dict[str, str] | None = None) -> None:
@@ -41,30 +43,25 @@ def generate(message: dict[str, Any], registry: ProviderRegistry) -> None:
     emit("result", message.get("id"), {"captions": [item.to_dict() for item in result], "provider": provider.id})
 
 
-def recognize(message: dict[str, Any]) -> None:
-    payload = message.get("payload") or {}
-    required = ("python", "script", "input", "output", "ffmpeg", "ffprobe", "model_dir")
-    missing = [key for key in required if not payload.get(key)]
-    if missing: raise ValueError("speech.recognize is missing: " + ", ".join(missing))
-    command = [str(payload["python"]), str(payload["script"]), "--input", str(payload["input"]), "--output", str(payload["output"]), "--model", str(payload.get("model", "small")), "--language", str(payload.get("language", "ja")), "--device", str(payload.get("device", "auto")), "--compute-type", str(payload.get("compute_type", "auto")), "--profile", str(payload.get("profile", "auto")), "--audio-enhancement", str(payload.get("audio_enhancement", "auto")), "--filler-mode", str(payload.get("filler_mode", "auto")), "--speech-recovery", str(payload.get("speech_recovery", "auto")), "--dictionary", str(payload.get("dictionary", "")), "--fps", str(payload.get("fps", 30)), "--ffmpeg", str(payload["ffmpeg"]), "--ffprobe", str(payload["ffprobe"]), "--model-dir", str(payload["model_dir"]), "--vad", "--word-timestamps"]
-    environment = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8", errors="replace", env=environment)
-    assert process.stdout is not None
-    legacy_error: dict[str, object] | None = None
-    for line in process.stdout:
-        try: event = json.loads(line)
-        except json.JSONDecodeError: continue
-        if event.get("type") == "error":
-            legacy_error = event
-        emit("progress", message.get("id"), event)
-    stderr = process.stderr.read() if process.stderr else ""
-    if process.wait() != 0:
-        if legacy_error:
-            code = str(legacy_error.get("code", "ATT_RECOGNITION_FAILED"))
-            detail = str(legacy_error.get("message", "legacy recognition failed"))
-            raise RuntimeError(f"{code}: {detail}")
-        raise RuntimeError(stderr[-2000:] or "legacy recognition failed")
-    emit("result", message.get("id"), {"output": str(payload["output"])})
+def recognize(message: dict[str, Any], service: RecognitionService) -> None:
+    request_id = message.get("id")
+    last_progress = {"value": -1.0, "time": 0.0}
+    import time
+    def forward(event_type: str, values: dict[str, Any]) -> None:
+        # Segment-rich material can emit hundreds of updates.  Throttle only
+        # visual progress; status and completion remain immediate.
+        now = time.monotonic()
+        value = values.get("value")
+        if event_type == "transcription_progress" and isinstance(value, (int, float)):
+            if now - last_progress["time"] < .20 and float(value) - last_progress["value"] < 1.0:
+                return
+            last_progress.update(value=float(value), time=now)
+        emit("progress", request_id, {"type": event_type, **values})
+    set_callback(forward)
+    try:
+        emit("result", request_id, service.recognize(message.get("payload") or {}))
+    finally:
+        set_callback(None)
 
 
 def health(registry: ProviderRegistry, manager: ModelManager) -> dict[str, object]:
@@ -103,6 +100,7 @@ def split_captions(message: dict[str, Any]) -> None:
 def main() -> int:
     manager = ModelManager(Path.cwd() / "models")
     registry = ProviderRegistry(manager)
+    recognition = RecognitionService()
     for line in sys.stdin:
         try:
             message = json.loads(line)
@@ -122,7 +120,7 @@ def main() -> int:
                 def progress(event: dict[str, object]) -> None: emit("progress", message.get("id"), event)
                 emit("result", message.get("id"), manager.download(str(payload.get("model_id", "gemma-4-e2b-it")), progress, lambda: False))
             elif message_type in {"ai.generate", "ai.rewrite", "ai.shorten", "ai.naturalize"}: generate(message, registry)
-            elif message.get("type") == "speech.recognize": recognize(message)
+            elif message.get("type") == "speech.recognize": recognize(message, recognition)
             else: raise ValueError("unsupported command")
         except Exception as error:
             emit("error", message.get("id") if "message" in locals() else None, error={"code": "FAT_PYTHON_ERROR", "message": str(error)})

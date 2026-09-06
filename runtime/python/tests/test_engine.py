@@ -16,6 +16,8 @@ from att_engine.progress import emit
 from att_engine.recognizer import FasterWhisperRecognizer, RecognitionOptions, clean_text
 from att_engine.speech_pipeline import TranscriptPostProcessor, build_initial_prompt, select_profile, warning_for
 from att_engine.speech_recovery import SpeechRecoverySettings, find_candidates, is_recoverable, merge_recovered, recovery_window
+from att_engine.progress import set_callback
+from att_engine.recognition_service import RecognitionService
 
 
 class FakeWord:
@@ -57,6 +59,25 @@ class EngineTests(unittest.TestCase):
         output = io.StringIO()
         with redirect_stdout(output): emit("progress", value=25, message="認識中")
         self.assertEqual("progress", json.loads(output.getvalue())["type"])
+
+    def test_persistent_recognition_service_caches_unchanged_probe_result(self):
+        with tempfile.TemporaryDirectory() as folder:
+            source = Path(folder) / "clip.mp4"
+            source.write_bytes(b"media")
+            service = RecognitionService()
+            with patch("att_engine.recognition_service.probe", return_value={"duration_seconds": 1.0}) as probe_call:
+                self.assertEqual(1.0, service._probe(Path("ffprobe.exe"), source)["duration_seconds"])
+                self.assertEqual(1.0, service._probe(Path("ffprobe.exe"), source)["duration_seconds"])
+            self.assertEqual(1, probe_call.call_count)
+
+    def test_embedded_progress_callback_does_not_write_legacy_stdout(self):
+        values = []
+        set_callback(lambda event_type, payload: values.append((event_type, payload)))
+        try:
+            emit("progress", value=42, message="更新")
+        finally:
+            set_callback(None)
+        self.assertEqual([("progress", {"value": 42, "message": "更新"})], values)
 
     def test_missing_ffmpeg(self):
         with self.assertRaises(AttError): AudioConverter(Path("missing.exe")).convert(Path("in.mp4"), Path("out.wav"))

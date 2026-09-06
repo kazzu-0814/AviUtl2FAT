@@ -712,13 +712,18 @@ public sealed class FatWindow : Window
 
     private void HandleShortcutKey(KeyEventArgs args)
     {
-        // Never take keys away from caption editors, settings text boxes, or an
-        // IME composition.  This preserves ordinary Space and Japanese input.
-        if (IsTextInputFocused()) return;
         var key = NormalizeKey(args);
         var modifiers = Keyboard.Modifiers;
-        if (_shortcutManager.Matches(ShortcutAction.TogglePreviewPlayback, key,
-                modifiers.HasFlag(ModifierKeys.Control), modifiers.HasFlag(ModifierKeys.Shift), modifiers.HasFlag(ModifierKeys.Alt)))
+        var isPlaybackShortcut = _shortcutManager.Matches(ShortcutAction.TogglePreviewPlayback, key,
+            modifiers.HasFlag(ModifierKeys.Control), modifiers.HasFlag(ModifierKeys.Shift), modifiers.HasFlag(ModifierKeys.Alt));
+
+        // Plain input always belongs to the active editor. An explicitly
+        // modified playback shortcut (Ctrl+Space by default) is intentionally
+        // allowed while editing a caption, and does not move keyboard focus.
+        // Do not interfere with an IME-processed key, even if a user chooses a
+        // conflicting custom shortcut.
+        if (IsTextInputFocused() && (!isPlaybackShortcut || args.Key == Key.ImeProcessed)) return;
+        if (isPlaybackShortcut)
         {
             if (_previewBackend.Status == PreviewPlayerStatus.Playing) PausePreview(); else PlayPreview();
             args.Handled = true;
@@ -1615,17 +1620,42 @@ public sealed class FatWindow : Window
     }
     private async Task RunWorkerAsync(RecognitionRequest request, Action<FatProgress> progress, CancellationToken cancellationToken)
     {
-        var pipeName = $"AviUtl2FAT-{Guid.NewGuid():N}"; var worker = Path.Combine(AppContext.BaseDirectory, "AviUtl2FAT.Worker.exe");
-        if (!File.Exists(worker)) throw new FatException("FAT_WORKER_MISSING", "AviUtl2FAT.Worker.exe was not found.");
-        using var process = Process.Start(new ProcessStartInfo(worker, $"--pipe {pipeName}") { UseShellExecute = false, CreateNoWindow = true }) ?? throw new FatException("FAT_WORKER_START_FAILED", "FAT Worker could not be started.");
-        using var cancellationRegistration = cancellationToken.Register(() => { try { if (!process.HasExited) process.Kill(true); } catch (InvalidOperationException) { } });
-        await using var pipe = new NamedPipeClientStream(".", pipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
-        try { await pipe.ConnectAsync(10_000, cancellationToken); }
-        catch (TimeoutException error) { throw new FatException("FAT_WORKER_CONNECT_TIMEOUT", "音声認識ワーカーの起動がタイムアウトしました。FATを再起動してもう一度実行してください。", error); }
-        using var reader = new StreamReader(pipe, new UTF8Encoding(false), false, leaveOpen: true); await using var writer = new StreamWriter(pipe, new UTF8Encoding(false), leaveOpen: true) { AutoFlush = true };
-        await writer.WriteLineAsync(JsonSerializer.Serialize(new FatIpcMessage("recognize", Guid.NewGuid().ToString("N"), request), JsonOptions));
-        while (await reader.ReadLineAsync(cancellationToken) is { } line) { var message = JsonSerializer.Deserialize<FatIpcMessage>(line, JsonOptions); if (message is null) continue; FatProtocols.Validate(message.Protocol, message.Version, FatProtocols.AppProtocol); if (message.Type == "error") throw new FatException(message.Error?.Code ?? "FAT_WORKER_ERROR", message.Error?.Message ?? "Worker failed."); if (message.Type == "completed") return; if (message.Type == "progress" && message.Payload is JsonElement payload) { var value = payload.TryGetProperty("value", out var number) && number.ValueKind == JsonValueKind.Number ? number.GetDouble() : (double?)null; var text = payload.TryGetProperty("message", out var item) ? item.GetString() ?? "Working..." : "Working..."; progress(new FatProgress("recognition", value, text)); } }
-        throw new FatException("FAT_WORKER_DISCONNECTED", "Worker disconnected before completion.");
+        var runtime = FindRuntime(AppContext.BaseDirectory);
+        var portablePython = Path.Combine(runtime, "python-runtime", "python.exe");
+        var python = File.Exists(portablePython) ? portablePython : Path.Combine(runtime, "python-env", "Scripts", "python.exe");
+        var ffmpeg = string.IsNullOrWhiteSpace(request.Settings.FfmpegPath) ? Path.Combine(runtime, "ffmpeg", "ffmpeg.exe") : request.Settings.FfmpegPath;
+        var ffprobe = string.IsNullOrWhiteSpace(request.Settings.FfprobePath) ? Path.Combine(runtime, "ffmpeg", "ffprobe.exe") : request.Settings.FfprobePath;
+        if (!File.Exists(python)) throw new FatException("FAT_RUNTIME_MISSING", "Python FAT Engine runtime was not found.");
+        if (!File.Exists(ffmpeg) || !File.Exists(ffprobe)) throw new FatException("FAT_FFMPEG_MISSING", "FFmpeg or ffprobe was not found.");
+        var payload = JsonSerializer.Serialize(new
+        {
+            input = request.InputPath, output = request.OutputPath,
+            model = request.Settings.RecognitionModel, language = request.Settings.Language,
+            device = request.Settings.Device, compute_type = request.Settings.ComputeType,
+            profile = request.Settings.SpeechProfile, audio_enhancement = request.Settings.AudioEnhancement,
+            filler_mode = request.Settings.FillerMode, speech_recovery = request.Settings.SpeechRecoveryMode,
+            dictionary = string.Join(",", request.Settings.RecognitionDictionary), fps = request.Settings.Fps,
+            ffmpeg, ffprobe, model_dir = request.Settings.ModelDirectory ?? Path.Combine(runtime, "models")
+        }, JsonOptions);
+        var response = await _pythonEngine.RequestAsync(runtime, "speech.recognize", payload, line =>
+        {
+            try
+            {
+                using var message = JsonDocument.Parse(line);
+                var root = message.RootElement;
+                if (!root.TryGetProperty("payload", out var envelope) || !envelope.TryGetProperty("message", out var text)) return;
+                var value = envelope.TryGetProperty("value", out var number) && number.ValueKind == JsonValueKind.Number ? number.GetDouble() : (double?)null;
+                progress(new FatProgress("recognition", value, text.GetString() ?? "Working..."));
+            }
+            catch (JsonException) { }
+        }, cancellationToken);
+        using var document = JsonDocument.Parse(response);
+        var root = document.RootElement;
+        if (root.GetProperty("type").GetString() == "error")
+        {
+            var error = root.GetProperty("error");
+            throw new FatException(error.GetProperty("code").GetString() ?? "FAT_PYTHON_ERROR", error.GetProperty("message").GetString() ?? "Python FAT engine failed.");
+        }
     }
     private static readonly JsonSerializerOptions JsonOptions = new() { PropertyNameCaseInsensitive = true, PropertyNamingPolicy = JsonNamingPolicy.CamelCase };
 }
@@ -2099,15 +2129,15 @@ public sealed class PersistentPythonWorker : IDisposable
     private StreamWriter? _writer;
     private Task<string>? _stderr;
 
-    public async Task<string> RequestAsync(string runtime, string type, string payload, Action<string>? progress = null)
+    public async Task<string> RequestAsync(string runtime, string type, string payload, Action<string>? progress = null, CancellationToken cancellationToken = default)
     {
-        await _gate.WaitAsync();
+        await _gate.WaitAsync(cancellationToken);
         try
         {
             StartIfNeeded(runtime);
             var id = Guid.NewGuid().ToString("N");
             await _writer!.WriteLineAsync($"{{\"protocol\":\"fat-python\",\"version\":1,\"id\":\"{id}\",\"type\":\"{type}\",\"payload\":{payload}}}");
-            while (await _reader!.ReadLineAsync() is { } line)
+            while (await _reader!.ReadLineAsync(cancellationToken) is { } line)
             {
                 // fat_worker.py owns stdout as UTF-8 JSON Lines.  A native
                 // dependency must never make an incidental diagnostic line
@@ -2127,6 +2157,13 @@ public sealed class PersistentPythonWorker : IDisposable
             var error = _stderr is null ? "" : await _stderr;
             Reset();
             throw new InvalidOperationException("FAT_PYTHON_DISCONNECTED: " + error);
+        }
+        catch (OperationCanceledException)
+        {
+            // A recognition command is not safe to resume halfway through.
+            // Stop the engine tree; the next request starts a clean worker.
+            Reset();
+            throw;
         }
         catch
         {
@@ -2165,13 +2202,9 @@ public sealed class PersistentPythonWorker : IDisposable
     private static string FindEngine(string runtime)
     {
         var installed = Path.Combine(runtime, "python", "fat_worker.py");
-        // In a development tree, use the current source before the copied runtime.
-        // A packaged installation normally has no sibling python source and falls back below.
-        for (var current = new DirectoryInfo(runtime).Parent; current is not null; current = current.Parent)
-        {
-            var candidate = Path.Combine(current.FullName, "python", "fat_worker.py");
-            if (File.Exists(candidate)) return candidate;
-        }
+        // runtime/python is the source of truth both in development and in a
+        // packaged installation.  Do not accidentally select a user's legacy
+        // sibling "python" folder, which may contain an older worker.
         return installed;
     }
 

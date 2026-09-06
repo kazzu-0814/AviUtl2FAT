@@ -47,6 +47,11 @@ def clean_text(text: str, remove_spaces: bool, remove_fillers: bool) -> str:
 
 
 class FasterWhisperRecognizer:
+    # A FAT Python engine is intentionally long-lived.  Reusing a loaded model
+    # avoids the largest fixed cost of a second subtitle generation and also
+    # lets bounded speech-recovery reuse the primary recognition model.
+    _model_cache: dict[tuple[str, str, str, int], object] = {}
+
     def __init__(self, options: RecognitionOptions) -> None:
         self.options = options
 
@@ -105,11 +110,18 @@ class FasterWhisperRecognizer:
             if device == "cpu" and compute in ("float16", "int8_float16"):
                 compute = "int8"
                 emit("status", message="CUDAを利用できないためCPU/int8へ切り替えました")
+        cache_key = (str(local_model.resolve()), device, compute, self.options.cpu_threads)
         try:
             throw_if_cancelled(self.options.cancel_file)
-            emit("status", message=f"モデルを読み込んでいます ({self.options.model}, {device}/{compute})")
-            model = WhisperModel(str(local_model), device=device, compute_type=compute,
-                                 cpu_threads=self.options.cpu_threads)
+            model = self._model_cache.get(cache_key)
+            if model is None:
+                emit("status", message=f"モデルを読み込んでいます ({self.options.model}, {device}/{compute})")
+                model = WhisperModel(str(local_model), device=device, compute_type=compute,
+                                     cpu_threads=self.options.cpu_threads)
+                # Keep only the active model.  Low-spec systems must not retain
+                # several Whisper instances after a user changes profile.
+                self._model_cache.clear()
+                self._model_cache[cache_key] = model
             raw_segments, info = model.transcribe(str(audio_path), language=self.options.language,
                                                   beam_size=self.options.beam_size,best_of=self.options.best_of,
                                                   temperature=self.options.temperature,vad_filter=self.options.vad,
@@ -121,7 +133,12 @@ class FasterWhisperRecognizer:
                 emit("status", message=f"CUDAの初期化に失敗したためCPU/int8で再試行します: {error}")
                 try:
                     device, compute = "cpu", "int8"
-                    model = WhisperModel(str(local_model), device=device, compute_type=compute,cpu_threads=self.options.cpu_threads)
+                    fallback_key = (str(local_model.resolve()), device, compute, self.options.cpu_threads)
+                    model = self._model_cache.get(fallback_key)
+                    if model is None:
+                        model = WhisperModel(str(local_model), device=device, compute_type=compute,cpu_threads=self.options.cpu_threads)
+                        self._model_cache.clear()
+                        self._model_cache[fallback_key] = model
                     raw_segments, info = model.transcribe(str(audio_path), language=self.options.language,
                                                           beam_size=self.options.beam_size,best_of=self.options.best_of,temperature=self.options.temperature,
                                                           vad_filter=self.options.vad,word_timestamps=self.options.word_timestamps,
