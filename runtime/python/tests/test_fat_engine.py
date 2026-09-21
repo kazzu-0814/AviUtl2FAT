@@ -2,6 +2,8 @@ import unittest
 import tempfile
 from pathlib import Path
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -44,8 +46,11 @@ class FatEngineTests(unittest.TestCase):
             root = Path(folder); model = root / "gemma-4-26b-a4b-it"; model.mkdir()
             for name in ("config.json", "processor_config.json", "tokenizer_config.json", "model.safetensors"): (model / name).write_text("{}", encoding="utf-8")
             manager = ModelManager(root, device_status=lambda: {"cuda": False, "selected": "cpu", "ram_available_bytes": 4_000_000_000, "vram_bytes": None})
-            with self.assertRaisesRegex(RuntimeError, "MODEL_INSUFFICIENT_MEMORY"): manager.load_model("gemma-4-26b-a4b-it", lambda _: object())
-            self.assertEqual(ModelRecommendation.NOT_RECOMMENDED, manager.compatibility("gemma-4-26b-a4b-it")["recommendation"])
+            with patch("fat_engine.model_manager.shutil.disk_usage", return_value=SimpleNamespace(free=100_000_000_000)):
+                with self.assertRaisesRegex(RuntimeError, "MODEL_INSUFFICIENT_MEMORY"): manager.load_model("gemma-4-26b-a4b-it", lambda _: object())
+                compatibility = manager.compatibility("gemma-4-26b-a4b-it")
+            self.assertEqual(ModelRecommendation.NOT_RECOMMENDED, compatibility["recommendation"])
+            self.assertEqual("MEMORY_INSUFFICIENT", compatibility["reason"])
 
     def test_switching_unloads_previous_gemma_model(self):
         with tempfile.TemporaryDirectory() as folder:
