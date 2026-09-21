@@ -189,7 +189,23 @@ jobs:
           }
 
           $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($installerPath)
-          if ($versionInfo.ProductName -ne 'AviUtl2 AltFactor') {
+          $actualProductName = $versionInfo.ProductName
+          $expectedProductName = 'AviUtl2 AltFactor'
+          function Write-ProductNameDiagnostic([string]$label, $value) {
+            $text = [string]$value
+            $typeName = if ($null -eq $value) { '<null>' } else { $value.GetType().FullName }
+            $codePoints = ($text.ToCharArray() | ForEach-Object { 'U+{0:X4}' -f [int][char]$_ }) -join ' '
+            $utf8 = [BitConverter]::ToString([Text.Encoding]::UTF8.GetBytes($text))
+            Write-Host "$label Value: [$text]"
+            Write-Host "$label Type: $typeName"
+            Write-Host "$label Length: $($text.Length)"
+            Write-Host "$label UTF-16: $codePoints"
+            Write-Host "$label UTF-8: $utf8"
+          }
+          Write-ProductNameDiagnostic 'Actual ProductName' $actualProductName
+          Write-ProductNameDiagnostic 'Expected ProductName' $expectedProductName
+          Write-Host "ProductName comparison: PowerShell -eq=$($actualProductName -eq $expectedProductName); Ordinal=$([string]::Equals([string]$actualProductName, [string]$expectedProductName, [StringComparison]::Ordinal)); OrdinalIgnoreCase=$([string]::Equals([string]$actualProductName, [string]$expectedProductName, [StringComparison]::OrdinalIgnoreCase))"
+          if ($actualProductName -ne $expectedProductName) {
             throw "Unexpected Product Name: $($versionInfo.ProductName)"
           }
           $acceptedVersions = @($env:BUILD_VERSION, "$env:BUILD_VERSION.0")
