@@ -136,8 +136,15 @@ jobs:
             throw 'ISCC.exe was not found after installing Inno Setup 6.'
           }
           Write-Host "ISCC path: $iscc"
-          $isccHelp = & $iscc /? 2>&1
-          $isccExitCode = $LASTEXITCODE
+          $previousNativePreference = $PSNativeCommandUseErrorActionPreference
+          try {
+            $PSNativeCommandUseErrorActionPreference = $false
+            $isccHelp = & $iscc /? 2>&1
+            $isccExitCode = $LASTEXITCODE
+          }
+          finally {
+            $PSNativeCommandUseErrorActionPreference = $previousNativePreference
+          }
           $isccHelp | Write-Host
           if ($isccExitCode -notin @(0, 1) -or ($isccHelp -join "`n") -notmatch 'Inno Setup 6') {
             throw "ISCC.exe version check failed (exit code $isccExitCode)."
