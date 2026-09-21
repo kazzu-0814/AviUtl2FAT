@@ -149,6 +149,8 @@ jobs:
           if ($isccExitCode -notin @(0, 1) -or ($isccHelp -join "`n") -notmatch 'Inno Setup 6') {
             throw "ISCC.exe version check failed (exit code $isccExitCode)."
           }
+          $global:LASTEXITCODE = 0
+          Write-Host "ISCC.exe verification passed (reported exit code $isccExitCode)."
 
       - name: Build installer with the project packaging script
         shell: pwsh
