@@ -30,10 +30,17 @@ class OutputWriter:
         output: list[dict[str, object]] = []
         for item in segments:  # generatorを逐次消費し、進捗通知も継続する
             start, end = float(item["start"]), float(item["end"])
-            output.append({**item, "start_frame": seconds_to_frame(start, self.fps),
-                           "end_frame": seconds_to_frame(end, self.fps), "speaker": None,
-                           "confidence": None, "style": {"font": None, "size": None, "color": None,
-                           "outline_color": None, "position": None}})
+            # Do not clone each segment into a second dictionary.  Keeping the
+            # post-processed object bounds long-recording memory to one segment list.
+            speaker = str(item.get("speaker_id") or item.get("speaker") or "A").strip().upper() or "A"
+            item["start_frame"] = seconds_to_frame(start, self.fps)
+            item["end_frame"] = seconds_to_frame(end, self.fps)
+            item["speaker_id"] = speaker
+            item["speaker"] = speaker
+            item.setdefault("confidence", None)
+            item.setdefault("style", {"font": None, "size": None, "color": None,
+                                      "outline_color": None, "position": None})
+            output.append(item)
         return {"format": "AviUtl2 ATT", "version": "0.5.5", "status":"completed", "is_partial":False, "source_file": source,
                 "source_duration": source_duration, "language": language, "model": model,
                 "device": device, "compute_type": compute_type, "fps": self.fps,

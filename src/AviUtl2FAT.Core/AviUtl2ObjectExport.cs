@@ -284,7 +284,7 @@ public sealed class AviUtl2ObjectExporter(AviUtl2ObjectTemplate template, AviUtl
                 var start = FatFiles.Frame(caption.StartTime, fps); var end = FatFiles.Frame(caption.EndTime, fps);
                 var name = $"FAT_{index + 1:0000}.object";
                 await AviUtl2ObjectTemplateParser.AtomicWriteAsync(Path.Combine(directoryPath, name), template.RenderCaption(caption, fps, style ?? AviUtl2TextStyle.Default), template.HasUtf8Bom, cancellationToken);
-                map.Add(new { file = name, caption_id = caption.Id, start_time = caption.StartTime, end_time = caption.EndTime, output_start = caption.StartTime, output_end = caption.EndTime, start_frame = start, end_frame = end, text = caption.Text, style = style ?? AviUtl2TextStyle.Default });
+                map.Add(new { file = name, caption_id = caption.Id, speaker_id = caption.SpeakerId, start_time = caption.StartTime, end_time = caption.EndTime, output_start = caption.StartTime, output_end = caption.EndTime, start_frame = start, end_frame = end, text = caption.Text, style = style ?? AviUtl2TextStyle.Default });
                 progress?.Report((index + 1, valid.Length));
             }
             var manifest = Path.Combine(directoryPath, "fat-object-export.json");
@@ -386,7 +386,7 @@ public sealed class AviUtl2MultiObjectExporter(AviUtl2ObjectTemplate template, A
                 template = new { template.SourcePath, template.Sha256 },
                 captions = plan.Select(placement => new
                 {
-                    caption_id = placement.Caption.Id, object_index = placement.ObjectIndex, layer = placement.Layer,
+                    caption_id = placement.Caption.Id, speaker_id = placement.Caption.SpeakerId, object_index = placement.ObjectIndex, layer = placement.Layer,
                     start_time = placement.Caption.StartTime, end_time = placement.Caption.EndTime,
                     start_frame = placement.StartFrame, end_frame = placement.EndFrame, text = placement.Caption.Text,
                     style = _style, source_caption_id = placement.Caption.Id, split_source_id = placement.Caption.Id

@@ -19,7 +19,9 @@ public static class FatFiles
                 item.TryGetProperty("original_text", out var original) ? original.GetString() ?? string.Empty : item.GetProperty("text").GetString() ?? string.Empty,
                 item.GetProperty("text").GetString() ?? string.Empty,
                 item.TryGetProperty("confidence", out var confidence) && confidence.ValueKind == JsonValueKind.Number ? confidence.GetDouble() : null,
-                !item.TryGetProperty("enabled", out var enabled) || enabled.GetBoolean())).ToArray();
+                !item.TryGetProperty("enabled", out var enabled) || enabled.GetBoolean(),
+                item.TryGetProperty("speaker_id", out var speaker) ? SpeakerIds.Normalize(speaker.GetString()) :
+                item.TryGetProperty("speaker", out var legacySpeaker) ? SpeakerIds.Normalize(legacySpeaker.GetString()) : "A")).ToArray();
             return segments;
         }
         catch (FatException) { throw; }

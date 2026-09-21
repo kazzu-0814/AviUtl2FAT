@@ -17,7 +17,7 @@ public sealed class PassthroughProvider : IAIProvider
     public Task<CaptionGenerationResponse> GenerateCaptionsAsync(CaptionGenerationRequest request, CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        var captions = request.Transcript.Select(x => new FATCaption(x.Id, x.StartTime, x.EndTime, x.OriginalText, x.Text, Id, null, x.Confidence, x.Enabled).Validate()).ToArray();
+        var captions = request.Transcript.Select(x => new FATCaption(x.Id, x.StartTime, x.EndTime, x.OriginalText, x.Text, Id, null, x.Confidence, x.Enabled, SpeakerId: x.SpeakerId).Validate()).ToArray();
         return Task.FromResult(new CaptionGenerationResponse(captions, Id));
     }
 }

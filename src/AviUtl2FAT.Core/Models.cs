@@ -13,17 +13,18 @@ public sealed record FATCaption(
     double? Confidence = null,
     bool Enabled = true,
     string? DetectedLanguage = null,
-    string? OutputLanguage = null)
+    string? OutputLanguage = null,
+    string SpeakerId = "A")
 {
     public FATCaption Validate()
     {
         if (string.IsNullOrWhiteSpace(Id)) throw new FatException("FAT_CAPTION_INVALID", "Caption ID is required.");
         if (StartTime < 0 || EndTime < StartTime) throw new FatException("FAT_CAPTION_INVALID", "Caption timing is invalid.");
-        return this with { OriginalTranscript = OriginalTranscript ?? string.Empty, Text = Text ?? string.Empty };
+        return this with { OriginalTranscript = OriginalTranscript ?? string.Empty, Text = Text ?? string.Empty, SpeakerId = SpeakerIds.Normalize(SpeakerId) };
     }
 }
 
-public sealed record TranscriptSegment(string Id, double StartTime, double EndTime, string OriginalText, string Text, double? Confidence = null, bool Enabled = true);
+public sealed record TranscriptSegment(string Id, double StartTime, double EndTime, string OriginalText, string Text, double? Confidence = null, bool Enabled = true, string SpeakerId = "A");
 public sealed record CaptionGenerationRequest(IReadOnlyList<TranscriptSegment> Transcript, string Style = "verbatim", string? Model = null);
 public sealed record CaptionGenerationResponse(IReadOnlyList<FATCaption> Captions, string Provider, string? Model = null);
 public sealed record FatError(string Code, string Message, string? Detail = null);

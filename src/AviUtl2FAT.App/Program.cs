@@ -21,19 +21,21 @@ namespace AviUtl2FAT.App;
 public sealed class CaptionRow(FATCaption caption) : INotifyPropertyChanged
 {
     private string _text = caption.Text;
+    private string _speakerId = SpeakerIds.Normalize(caption.SpeakerId);
     private bool _isCurrent;
     public string Id { get; } = caption.Id;
     public double StartTime { get; } = caption.StartTime;
     public double EndTime { get; } = caption.EndTime;
     public string OriginalTranscript { get; } = caption.OriginalTranscript;
     public string Text { get => _text; set { if (_text != value) { _text = value; Changed(); } } }
+    public string SpeakerId { get => _speakerId; set { var normalized = SpeakerIds.Normalize(value); if (_speakerId != normalized) { _speakerId = normalized; Changed(); } } }
     public string Provider { get; private set; } = caption.Provider;
     public string? Model { get; private set; } = caption.Model;
     public bool IsCurrent { get => _isCurrent; set { if (_isCurrent != value) { _isCurrent = value; Changed(); Changed(nameof(CurrentMarker)); } } }
     public string CurrentMarker => IsCurrent ? "▶" : string.Empty;
     public string Warning => CaptionQuality.Warning(ToCaption()) is { } warning ? "⚠ 要確認: " + warning : string.Empty;
-    public FATCaption ToCaption() => new(Id, StartTime, EndTime, OriginalTranscript, Text, Provider, Model, caption.Confidence, caption.Enabled, caption.DetectedLanguage, caption.OutputLanguage);
-    public void Apply(FATCaption caption) { _text = caption.Text; Provider = caption.Provider; Model = caption.Model; Changed(nameof(Text)); Changed(nameof(Warning)); }
+    public FATCaption ToCaption() => new(Id, StartTime, EndTime, OriginalTranscript, Text, Provider, Model, caption.Confidence, caption.Enabled, caption.DetectedLanguage, caption.OutputLanguage, SpeakerId);
+    public void Apply(FATCaption caption) { _text = caption.Text; _speakerId = SpeakerIds.Normalize(caption.SpeakerId); Provider = caption.Provider; Model = caption.Model; Changed(nameof(Text)); Changed(nameof(SpeakerId)); Changed(nameof(Warning)); }
     public event PropertyChangedEventHandler? PropertyChanged;
     private void Changed([CallerMemberName] string? name = null) { PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(name)); if (name == nameof(Text)) PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(nameof(Warning))); }
 }
@@ -391,6 +393,8 @@ public sealed class FatWindow : Window
     private readonly ComboBox _aiProvider = AiSelector();
     private readonly TextBlock _aiState = new() { Text = "今回使用するAI: AIなし（高速）" };
     private readonly ObservableCollection<CaptionRow> _captions = [];
+    private readonly ComboBox _speakerFilter = new() { Width = 128, Margin = new Thickness(10, 0, 4, 0) };
+    private readonly ComboBox _speakerAssignment = new() { Width = 72, Margin = new Thickness(6, 0, 4, 0) };
     private readonly ProviderRegistry _providers = ProviderRegistry.CreateDefault();
     private readonly PersistentPythonWorker _pythonEngine = new();
     private readonly RuleBasedProvider _ruleProvider = new();
@@ -417,6 +421,7 @@ public sealed class FatWindow : Window
     private readonly DispatcherTimer _previewTimer = new() { Interval = TimeSpan.FromMilliseconds(100) };
     private readonly IVideoPreviewBackend _previewBackend;
     private DataGrid? _captionGrid;
+    private System.ComponentModel.ICollectionView? _captionView;
     private CaptionRow? _editingCaption;
     private int _textSelectionStart;
     private int _textSelectionLength;
@@ -510,6 +515,18 @@ public sealed class FatWindow : Window
         progressBox.Children.Add(new TextBlock { Text = "処理状況", FontWeight = FontWeights.SemiBold }); progressBox.Children.Add(_status); progressBox.Children.Add(_progress);
         progressBox.Children.Add(new TextBlock { Text = "字幕を編集・同期", FontSize = 16, FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 14, 0, 4) });
         progressBox.Children.Add(new TextBlock { Text = "行をクリックするとプレビュー位置へ移動します。再生中の行は ▶ と淡い青で表示されます。字幕本文は直接編集できます。", Foreground = System.Windows.Media.Brushes.DimGray, Margin = new Thickness(0, 0, 0, 8) });
+        var speakerTools = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 0, 0, 6) };
+        speakerTools.Children.Add(new TextBlock { Text = "話者表示:", VerticalAlignment = VerticalAlignment.Center });
+        _speakerFilter.Items.Add(new ComboBoxItem { Content = "全員", Tag = string.Empty });
+        foreach (var speaker in SpeakerIds.DefaultChoices) _speakerFilter.Items.Add(new ComboBoxItem { Content = $"Speaker {speaker}", Tag = speaker });
+        _speakerFilter.SelectedIndex = 0;
+        speakerTools.Children.Add(_speakerFilter);
+        speakerTools.Children.Add(new TextBlock { Text = "選択行の話者:", Margin = new Thickness(12, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center });
+        foreach (var speaker in SpeakerIds.DefaultChoices) _speakerAssignment.Items.Add(new ComboBoxItem { Content = speaker, Tag = speaker });
+        _speakerAssignment.SelectedIndex = 0;
+        speakerTools.Children.Add(_speakerAssignment);
+        AddButton(speakerTools, "選択行へ適用", (_, _) => ApplySpeakerToSelected());
+        progressBox.Children.Add(speakerTools);
         var grid = new DataGrid
         {
             AutoGenerateColumns = false,
@@ -539,8 +556,13 @@ public sealed class FatWindow : Window
         grid.Columns.Add(new DataGridTextColumn { Header = "", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.CurrentMarker)), IsReadOnly = true, Width = 32 });
         grid.Columns.Add(new DataGridTextColumn { Header = "Start", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.StartTime)) { StringFormat = "0.000" }, IsReadOnly = true, Width = 90 });
         grid.Columns.Add(new DataGridTextColumn { Header = "End", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.EndTime)) { StringFormat = "0.000" }, IsReadOnly = true, Width = 90 });
+        grid.Columns.Add(new DataGridTextColumn { Header = "話者", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.SpeakerId)) { UpdateSourceTrigger = System.Windows.Data.UpdateSourceTrigger.PropertyChanged }, Width = 66 });
         grid.Columns.Add(new DataGridTextColumn { Header = "字幕本文（クリックして直接編集）", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.Text)) { UpdateSourceTrigger = System.Windows.Data.UpdateSourceTrigger.PropertyChanged }, Width = new DataGridLength(1, DataGridLengthUnitType.Star) });
         grid.Columns.Add(new DataGridTextColumn { Header = "確認", Binding = new System.Windows.Data.Binding(nameof(CaptionRow.Warning)), IsReadOnly = true, Width = 220 });
+        _captionView = System.Windows.Data.CollectionViewSource.GetDefaultView(_captions);
+        _captionView.Filter = MatchesSpeakerFilter;
+        grid.ItemsSource = _captionView;
+        _speakerFilter.SelectionChanged += (_, _) => _captionView?.Refresh();
         _captionGrid = grid; center.Children.Add(grid);
         grid.PreparingCellForEdit += (_, eventArgs) =>
         {
@@ -1262,15 +1284,24 @@ public sealed class FatWindow : Window
         if (_isRecognizing) return;
         _isRecognizing = true;
         _recognitionCancellation = new CancellationTokenSource();
+        string? output = null;
+        var totalTimer = Stopwatch.StartNew();
         _recognizeButton.Content = "停止";
         try
         {
             _progress.Value = 0; _status.Text = "Starting worker...";
-            var output = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", $"{Guid.NewGuid():N}.att.json");
+            output = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", $"{Guid.NewGuid():N}.att.json");
             var recognitionLanguage = SelectedLanguage(_recognitionLanguage); var outputLanguage = SelectedLanguage(_outputLanguage);
+            var recognitionTimer = Stopwatch.StartNew();
             await RunWorkerAsync(new RecognitionRequest(_input, output, new FatSettings { Version = CurrentVersion, Language = recognitionLanguage, RecognitionLanguage = recognitionLanguage, CaptionOutputLanguage = outputLanguage, SpeechProfile = (string)((ComboBoxItem)_recognitionProfile.SelectedItem).Tag, SpeechRecoveryMode = (string)((ComboBoxItem)_speechRecovery.SelectedItem).Tag }), p => { _status.Text = p.Message; if (p.Value is not null) _progress.Value = Math.Clamp(p.Value.Value, 0, 100); }, _recognitionCancellation.Token);
-            var transcript = await FatFiles.ReadAttTranscriptAsync(output, CancellationToken.None);
-            var response = await _providers.GetRequired("passthrough").GenerateCaptionsAsync(new CaptionGenerationRequest(transcript), CancellationToken.None);
+            recognitionTimer.Stop();
+            var transcript = await FatFiles.ReadAttTranscriptAsync(output, _recognitionCancellation.Token);
+            var shapingTimer = Stopwatch.StartNew();
+            var (captions, report) = await CaptionProcessingPipeline.BuildAsync(transcript, FormatTranscriptSegmentAsync, _recognitionCancellation.Token);
+            shapingTimer.Stop();
+            totalTimer.Stop();
+            Trace.WriteLine($"FAT v1.1.5 pipeline: recognition={recognitionTimer.Elapsed.TotalSeconds:F2}s, shaping={shapingTimer.Elapsed.TotalSeconds:F2}s, total={totalTimer.Elapsed.TotalSeconds:F2}s, queueMax={report.MaximumDepth}, completed={report.Completed}, failed={report.Failed}, workingSet={Environment.WorkingSet / 1024 / 1024}MB");
+            var response = new CaptionGenerationResponse(captions, PassthroughProvider.ProviderId);
             _lastGenerated = response.Captions; Load(response.Captions); _progress.Value = 100; _status.Text = $"完了: {_captions.Count} 件の字幕を編集できます。";
         }
         catch (OperationCanceledException) { _status.Text = "字幕生成を停止しました。既存の字幕はそのまま保持されています。"; }
@@ -1278,6 +1309,13 @@ public sealed class FatWindow : Window
         catch (Exception exception) { Error("FAT_APP_UNEXPECTED", exception.Message); }
         finally
         {
+            if (!string.IsNullOrWhiteSpace(output))
+            {
+                foreach (var temporary in new[] { output, Path.ChangeExtension(output, ".txt"), Path.ChangeExtension(output, ".srt") })
+                {
+                    try { File.Delete(temporary); } catch (IOException) { }
+                }
+            }
             _recognitionCancellation?.Dispose();
             _recognitionCancellation = null;
             _isRecognizing = false;
@@ -1285,7 +1323,27 @@ public sealed class FatWindow : Window
             _recognizeButton.IsEnabled = true;
         }
     }
-    private async Task RegenerateAsync() { try { var transcript = _captions.Select(x => new TranscriptSegment(x.Id, x.StartTime, x.EndTime, x.OriginalTranscript, x.Text)).ToArray(); var response = await _providers.GetRequired("passthrough").GenerateCaptionsAsync(new CaptionGenerationRequest(transcript), CancellationToken.None); _lastGenerated = response.Captions; Load(response.Captions); _status.Text = "Regenerated with Passthrough."; } catch (FatException exception) { Error(exception.Code, exception.Message); } }
+    private static ValueTask<FATCaption> FormatTranscriptSegmentAsync(TranscriptSegment segment, CancellationToken cancellationToken)
+    {
+        cancellationToken.ThrowIfCancellationRequested();
+        return ValueTask.FromResult(new FATCaption(segment.Id, segment.StartTime, segment.EndTime,
+            segment.OriginalText, segment.Text, PassthroughProvider.ProviderId, null,
+            segment.Confidence, segment.Enabled, SpeakerId: segment.SpeakerId).Validate());
+    }
+
+    private async Task RegenerateAsync()
+    {
+        try
+        {
+            var transcript = _captions.Select(x => new TranscriptSegment(x.Id, x.StartTime, x.EndTime,
+                x.OriginalTranscript, x.Text, SpeakerId: x.SpeakerId)).ToArray();
+            var (captions, report) = await CaptionProcessingPipeline.BuildAsync(transcript, FormatTranscriptSegmentAsync, CancellationToken.None);
+            _lastGenerated = captions;
+            Load(captions);
+            _status.Text = report.Failed == 0 ? "Regenerated with Passthrough." : $"Regenerated with {report.Failed} failed item(s).";
+        }
+        catch (FatException exception) { Error(exception.Code, exception.Message); }
+    }
     private async Task TransformSelectedAsync(CaptionOperation operation)
     {
         var selected = _captionGrid?.SelectedItems.Cast<CaptionRow>().Select(row => row.ToCaption()).ToArray() ?? [];
@@ -1579,6 +1637,32 @@ public sealed class FatWindow : Window
         else if (_lastGenerated.Count > 0) { Load(_lastGenerated); _status.Text = "認識直後の字幕へ戻しました。"; }
         else Error("FAT_UNDO_EMPTY", "元に戻せる変更がありません。");
     }
+    private bool MatchesSpeakerFilter(object item)
+    {
+        if (item is not CaptionRow row) return false;
+        return _speakerFilter.SelectedItem is not ComboBoxItem filter ||
+               string.IsNullOrEmpty(filter.Tag as string) ||
+               string.Equals(row.SpeakerId, filter.Tag as string, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private void ApplySpeakerToSelected()
+    {
+        _captionGrid?.CommitEdit(DataGridEditingUnit.Cell, true);
+        _captionGrid?.CommitEdit(DataGridEditingUnit.Row, true);
+        var selected = SelectedCaptionRows();
+        if (selected.Count == 0)
+        {
+            Error("FAT_SPEAKER_SELECTION_REQUIRED", "話者を変更する字幕行を選択してください。");
+            return;
+        }
+        if (_speakerAssignment.SelectedItem is not ComboBoxItem assignment || assignment.Tag is not string speaker) return;
+        _undo.Push(_captions.Select(row => row.ToCaption()).ToArray());
+        foreach (var row in selected) row.SpeakerId = speaker;
+        _captionView?.Refresh();
+        ScheduleDraftAutosave();
+        _status.Text = $"{selected.Count} 件の話者を {speaker} に変更しました。";
+    }
+
     private void Load(IReadOnlyList<FATCaption> captions)
     {
         _captions.Clear();
@@ -1587,7 +1671,7 @@ public sealed class FatWindow : Window
             var row = new CaptionRow(caption);
             row.PropertyChanged += (_, eventArgs) =>
             {
-                if (eventArgs.PropertyName == nameof(CaptionRow.Text))
+                if (eventArgs.PropertyName is nameof(CaptionRow.Text) or nameof(CaptionRow.SpeakerId))
                 {
                     if (ReferenceEquals(row, _currentCaption)) UpdatePreviewOverlay();
                     ScheduleDraftAutosave();
@@ -1600,6 +1684,7 @@ public sealed class FatWindow : Window
         _editingCaption = null;
         _textSelectionStart = 0;
         _textSelectionLength = 0;
+        _captionView?.Refresh();
         UpdatePlaybackSync();
         ScheduleDraftAutosave();
     }
