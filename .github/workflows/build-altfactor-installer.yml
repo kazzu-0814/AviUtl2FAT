@@ -189,7 +189,11 @@ jobs:
           }
 
           $versionInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($installerPath)
-          $actualProductName = $versionInfo.ProductName
+          # Windows FileVersionInfo pads this value with U+0020 to a fixed-width
+          # version-resource field. Preserve all meaningful characters and remove
+          # only the observed trailing ordinary spaces before an ordinal comparison.
+          $actualProductNameRaw = [string]$versionInfo.ProductName
+          $actualProductName = $actualProductNameRaw.TrimEnd([char]' ')
           $expectedProductName = 'AviUtl2 AltFactor'
           function Write-ProductNameDiagnostic([string]$label, $value) {
             $text = [string]$value
@@ -202,11 +206,18 @@ jobs:
             Write-Host "$label UTF-16: $codePoints"
             Write-Host "$label UTF-8: $utf8"
           }
-          Write-ProductNameDiagnostic 'Actual ProductName' $actualProductName
+          Write-ProductNameDiagnostic 'Actual ProductName (raw)' $actualProductNameRaw
+          Write-ProductNameDiagnostic 'Actual ProductName (trailing U+0020 removed)' $actualProductName
           Write-ProductNameDiagnostic 'Expected ProductName' $expectedProductName
-          Write-Host "ProductName comparison: PowerShell -eq=$($actualProductName -eq $expectedProductName); Ordinal=$([string]::Equals([string]$actualProductName, [string]$expectedProductName, [StringComparison]::Ordinal)); OrdinalIgnoreCase=$([string]::Equals([string]$actualProductName, [string]$expectedProductName, [StringComparison]::OrdinalIgnoreCase))"
-          if ($actualProductName -ne $expectedProductName) {
-            throw "Unexpected Product Name: $($versionInfo.ProductName)"
+          $trailingSpaceCount = $actualProductNameRaw.Length - $actualProductName.Length
+          $productNameMatches = [string]::Equals(
+            $actualProductName,
+            $expectedProductName,
+            [StringComparison]::Ordinal)
+          Write-Host "Actual ProductName trailing U+0020 count: $trailingSpaceCount"
+          Write-Host "ProductName comparison: strict ordinal after trailing U+0020 removal=$productNameMatches"
+          if (-not $productNameMatches) {
+            throw "Unexpected Product Name: [$actualProductName]"
           }
           $acceptedVersions = @($env:BUILD_VERSION, "$env:BUILD_VERSION.0")
           if ($versionInfo.FileVersion -notin $acceptedVersions) {
