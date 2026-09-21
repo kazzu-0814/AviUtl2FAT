@@ -32,9 +32,12 @@ class FatEngineTests(unittest.TestCase):
     def test_registry_has_all_official_gemma_variants(self):
         with tempfile.TemporaryDirectory() as folder:
             manager = ModelManager(Path(folder))
-            self.assertEqual(
-                {"google/gemma-4-E2B-it", "google/gemma-4-E4B-it", "google/gemma-4-12B-it", "google/gemma-4-26B-A4B-it"},
-                {item.source for item in manager.registry.all()})
+            self.assertTrue({"google/gemma-4-E2B-it", "google/gemma-4-E4B-it", "google/gemma-4-12B-it", "google/gemma-4-26B-A4B-it"}.issubset({item.source for item in manager.registry.all()}))
+
+    def test_local_registry_includes_opt_in_japanese_models(self):
+        with tempfile.TemporaryDirectory() as folder:
+            ids = {item.id for item in ModelManager(Path(folder)).registry.all()}
+            self.assertTrue({"llm-jp-3-1.8b-instruct", "llm-jp-3-3.7b-instruct", "llama-3-elyza-jp-8b-gguf"}.issubset(ids))
 
     def test_low_memory_rejects_large_model_load(self):
         with tempfile.TemporaryDirectory() as folder:

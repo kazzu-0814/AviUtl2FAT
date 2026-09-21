@@ -20,12 +20,14 @@ from .output_writer import OutputWriter
 from .recognizer import FasterWhisperRecognizer, RecognitionOptions
 from .speech_pipeline import TranscriptPostProcessor, build_initial_prompt, select_profile, warning_for
 from .speech_recovery import SpeechRecoverySettings, find_candidates, is_recoverable, merge_recovered, recovery_window
+from .diarization import DiarizationUnavailable, SpeakerDiarizationProviderFactory, align_segments
 
 
 class RecognitionService:
     def __init__(self) -> None:
         self._probe_cache: dict[tuple[str, int, int], dict[str, object]] = {}
         self._audio_cache: dict[tuple[str, int, int, str], Path] = {}
+        self._diarization = SpeakerDiarizationProviderFactory()
 
     @staticmethod
     def _signature(path: Path) -> tuple[str, int, int]:
@@ -118,6 +120,30 @@ class RecognitionService:
                 recovered.extend(item for item in cleaned if candidate.start <= (float(item["start"]) + float(item["end"])) / 2 <= candidate.end and is_recoverable(item, recovery_settings))
             collected = merge_recovered(collected, recovered)
             emit("progress", stage="recovery", value=96, message=f"認識漏れ補正を完了しました（追加 {len(recovered)} 件）")
+        diarization_mode = str(payload.get("diarization_mode", "off"))
+        diarization_settings = {"expected_speakers": payload.get("diarization_expected_speakers", 2),
+                                "model_path": payload.get("diarization_model_path")}
+        if diarization_mode.lower() != "off":
+            emit("progress", stage="diarization", value=97, message="Analyzing speakers from audio...")
+            try:
+                provider = self._diarization.select(diarization_mode, diarization_settings)
+                turns = provider.diarize(wav_path, diarization_settings, cancel_file)
+                align_segments(collected, turns)
+                emit("status", message=f"Speaker diarization completed ({provider.id}, {len(turns)} turns).")
+            except DiarizationUnavailable as error:
+                # Compatibility fallback: never infer people from text or turn order.
+                align_segments(collected, [])
+                emit("status", message=str(error))
+            except AttError:
+                # Cancellation is an AttError and must never be converted into success.
+                throw_if_cancelled(cancel_file)
+                raise
+            except Exception as error:
+                # A local provider failure must not discard a completed transcript.
+                align_segments(collected, [])
+                emit("status", message=f"Speaker diarization failed ({type(error).__name__}); using Speaker A.")
+        else:
+            align_segments(collected, [])
         for index, item in enumerate(collected, start=1):
             item["id"] = index
             item["warning"] = warning_for(item)

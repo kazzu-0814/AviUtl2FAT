@@ -41,7 +41,7 @@ if (-not $SkipRuntime -and -not (Test-Path -LiteralPath (Join-Path $destination 
 
 [pscustomobject]@{
     Installed = $destination
-    Menu = '編集 → プラグイン → AviUtl2 FAT → FAT を開く'
+    Menu = '編集 → プラグイン → AviUtl2 AltFactor → AltFactor を開く'
     RuntimeIncluded = -not $SkipRuntime
     Backup = if (Test-Path -LiteralPath $backupRoot) { $backupRoot } else { $null }
 } | ConvertTo-Json

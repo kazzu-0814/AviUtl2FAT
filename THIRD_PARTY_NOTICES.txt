@@ -1,4 +1,4 @@
-AviUtl2 FAT v1.0.0 — Third-party notices
+AviUtl2 AltFactor V2.0 Stable — Third-party notices
 ===========================================
 
 This is an attribution index, not a replacement for the upstream license texts.

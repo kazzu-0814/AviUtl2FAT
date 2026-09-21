@@ -25,6 +25,32 @@ public sealed record FATCaption(
 }
 
 public sealed record TranscriptSegment(string Id, double StartTime, double EndTime, string OriginalText, string Text, double? Confidence = null, bool Enabled = true, string SpeakerId = "A");
+
+/// <summary>Configuration for an optional, explicitly installed local diarization provider.</summary>
+public sealed record SpeakerDiarizationSettings
+{
+    public string Mode { get; init; } = "off";
+    public int ExpectedSpeakers { get; init; } = 2;
+    public string? ModelPath { get; init; }
+
+    public SpeakerDiarizationSettings Normalize() => this with
+    {
+        Mode = Mode?.Trim().ToLowerInvariant() switch { "auto" => "auto", "local" => "local", _ => "off" },
+        ExpectedSpeakers = Math.Clamp(ExpectedSpeakers, 2, 6),
+        ModelPath = string.IsNullOrWhiteSpace(ModelPath) ? null : ModelPath.Trim()
+    };
+
+    public static SpeakerDiarizationSettings Disabled { get; } = new();
+}
+
+public sealed record SpeakerTimelineEntry(double StartTime, double EndTime, string SpeakerId, double? Confidence = null)
+{
+    public SpeakerTimelineEntry Validate()
+    {
+        if (StartTime < 0 || EndTime < StartTime) throw new FatException("FAT_SPEAKER_TIMELINE_INVALID", "Speaker timeline timing is invalid.");
+        return this with { SpeakerId = SpeakerIds.Normalize(SpeakerId) };
+    }
+}
 public sealed record CaptionGenerationRequest(IReadOnlyList<TranscriptSegment> Transcript, string Style = "verbatim", string? Model = null);
 public sealed record CaptionGenerationResponse(IReadOnlyList<FATCaption> Captions, string Provider, string? Model = null);
 public sealed record FatError(string Code, string Message, string? Detail = null);
@@ -46,6 +72,7 @@ public sealed record FatSettings
     public string ComputeType { get; init; } = "auto";
     public string SpeechProfile { get; init; } = "auto";
     public string SpeechRecoveryMode { get; init; } = "auto";
+    public SpeakerDiarizationSettings SpeakerDiarization { get; init; } = SpeakerDiarizationSettings.Disabled;
     public string AudioEnhancement { get; init; } = "auto";
     public string FillerMode { get; init; } = "auto";
     public string CpuLoad { get; init; } = "auto";

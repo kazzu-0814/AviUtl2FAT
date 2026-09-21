@@ -16,7 +16,7 @@ use windows_sys::Win32::System::LibraryLoader::{
     GetModuleFileNameW, GetModuleHandleExW,
 };
 
-const TITLE: &str = "AviUtl2 FAT v1.0";
+const TITLE: &str = "AviUtl2 AltFactor";
 static STARTING: AtomicBool = AtomicBool::new(false);
 static EDIT_HANDLE: GlobalEditHandle = GlobalEditHandle::new();
 
@@ -25,25 +25,25 @@ struct FatPlugin;
 
 impl GenericPlugin for FatPlugin {
     fn new(_: aviutl2::AviUtl2Info) -> AnyResult<Self> {
-        log("FAT plugin loaded");
+        log("AltFactor plugin loaded");
         Ok(Self)
     }
     fn plugin_info(&self) -> GenericPluginTable {
         GenericPluginTable {
             name: TITLE.into(),
-            information: "Formation Auto Text / isolated FAT Worker integration".into(),
+            information: "Local AI Factory / isolated compatibility Worker integration".into(),
         }
     }
     fn register(&mut self, host: &mut HostAppHandle) {
         EDIT_HANDLE.init(host.create_edit_handle());
         // The SDK uses '\\' to create menu levels.  Keep FAT with the other
-        // user-facing plugins: 編集 → プラグイン → AviUtl2 FAT → FAT を開く.
-        host.register_edit_menu("プラグイン\\AviUtl2 FAT\\FAT を開く", open_fat);
-        host.register_edit_menu("プラグイン\\AviUtl2 FAT\\動画を選択して開始", open_media);
-        host.register_edit_menu("プラグイン\\AviUtl2 FAT\\ログを開く", open_logs);
-        host.register_edit_menu("プラグイン\\AviUtl2 FAT\\AviUtl2 FAT について", open_about);
-        host.register_edit_menu("プラグイン\\AviUtl2 FAT\\開発者\\Effect一覧をログ出力", dump_effects);
-        host.register_edit_menu("プラグイン\\AviUtl2 FAT\\開発者\\Effect設定項目をログ出力", dump_effect_items);
+        // User-facing plugins: 編集 → プラグイン → AviUtl2 AltFactor → AltFactor を開く.
+        host.register_edit_menu("プラグイン\\AviUtl2 AltFactor\\AltFactor を開く", open_fat);
+        host.register_edit_menu("プラグイン\\AviUtl2 AltFactor\\動画を選択して開始", open_media);
+        host.register_edit_menu("プラグイン\\AviUtl2 AltFactor\\ログを開く", open_logs);
+        host.register_edit_menu("プラグイン\\AviUtl2 AltFactor\\AviUtl2 AltFactor について", open_about);
+        host.register_edit_menu("プラグイン\\AviUtl2 AltFactor\\開発者\\Effect一覧をログ出力", dump_effects);
+        host.register_edit_menu("プラグイン\\AviUtl2 AltFactor\\開発者\\Effect設定項目をログ出力", dump_effect_items);
     }
 }
 

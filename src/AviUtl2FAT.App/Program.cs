@@ -380,7 +380,10 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
 public sealed class FatWindow : Window
 {
     private static readonly string CurrentVersion = GetCurrentVersion();
-    private const string ReleasesApiUrl = "https://api.github.com/repos/kazzu-0814/AviUtl2FAT/releases?per_page=20";
+    // V1 clients have this legacy endpoint compiled in. Keep publishing V2.0
+    // there until the V1 migration window has been explicitly closed.
+    private const string LegacyReleasesApiUrl = "https://api.github.com/repos/kazzu-0814/AviUtl2FAT/releases?per_page=20";
+    private const string AltFactorReleasesApiUrl = "https://api.github.com/repos/kazzu-0814/AviUtl2-AltFactor/releases?per_page=20";
     private const string ReleasesPageUrl = "https://github.com/kazzu-0814/AviUtl2FAT/releases";
     private static readonly HttpClient UpdateClient = CreateUpdateClient();
     private readonly TextBlock _media = new() { Text = "Media: not selected" };
@@ -390,6 +393,8 @@ public sealed class FatWindow : Window
     private readonly ComboBox _outputLanguage = LanguageSelector("ja", includeAuto: false);
     private readonly ComboBox _recognitionProfile = RecognitionProfileSelector();
     private readonly ComboBox _speechRecovery = SpeechRecoverySelector();
+    private readonly ComboBox _diarizationMode = new() { Width = 100, Margin = new Thickness(4, 0, 0, 0) };
+    private readonly ComboBox _expectedSpeakers = new() { Width = 56, Margin = new Thickness(4, 0, 0, 0) };
     private readonly ComboBox _aiProvider = AiSelector();
     private readonly TextBlock _aiState = new() { Text = "今回使用するAI: AIなし（高速）" };
     private readonly ObservableCollection<CaptionRow> _captions = [];
@@ -432,7 +437,9 @@ public sealed class FatWindow : Window
     private readonly string _aiSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
     private readonly string _previewSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "preview-settings.json");
     private readonly string _shortcutSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "shortcut-settings.json");
+    private readonly string _speakerSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "speaker-settings.json");
     private readonly string _autosaveDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "autosave");
+    private readonly string _brandMigrationNoticePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "altfactor-v2-notice.json");
     private readonly DispatcherTimer _draftAutosaveTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private string? _input;
     private bool _isRecognizing;
@@ -450,6 +457,7 @@ public sealed class FatWindow : Window
     private DateTimeOffset _suspendAutoFollowUntil = DateTimeOffset.MinValue;
     private ShortcutSettings _shortcutSettings = ShortcutSettings.Default;
     private ShortcutManager _shortcutManager = new();
+    private SpeakerSettingsDocument _speakerSettings = SpeakerSettingsDocument.Default;
     private double _draftDurationSeconds;
     private double _draftFramesPerSecond = 30;
     private bool _draftDirty;
@@ -457,7 +465,13 @@ public sealed class FatWindow : Window
     public FatWindow()
     {
         _previewBackend = new FfmpegFramePreviewBackend(_previewImage, FindRuntime(AppContext.BaseDirectory));
-        Title = $"AviUtl2 FAT v{CurrentVersion} - Formation Auto Text"; Width = 1200; Height = 780; MinWidth = 980; MinHeight = 620;
+        Title = $"AviUtl2 AltFactor V{CurrentVersion} - Local AI Factory"; Width = 1200; Height = 780; MinWidth = 980; MinHeight = 620;
+        _diarizationMode.Items.Add(new ComboBoxItem { Content = "OFF", Tag = "off" });
+        _diarizationMode.Items.Add(new ComboBoxItem { Content = "自動", Tag = "auto" });
+        _diarizationMode.Items.Add(new ComboBoxItem { Content = "ローカル", Tag = "local" });
+        _diarizationMode.SelectedIndex = 0;
+        foreach (var count in Enumerable.Range(2, 5)) _expectedSpeakers.Items.Add(new ComboBoxItem { Content = count.ToString(), Tag = count });
+        _expectedSpeakers.SelectedIndex = 0;
         var root = new Grid { Background = System.Windows.Media.Brushes.White };
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(150) });
         root.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -466,7 +480,7 @@ public sealed class FatWindow : Window
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); Content = root;
 
         var navigation = new StackPanel { Background = new System.Windows.Media.SolidColorBrush(System.Windows.Media.Color.FromRgb(31, 41, 55)), Margin = new Thickness(0) };
-        navigation.Children.Add(new TextBlock { Text = "AviUtl2\nFAT", Foreground = System.Windows.Media.Brushes.White, FontSize = 22, FontWeight = FontWeights.Bold, Margin = new Thickness(20, 24, 8, 28) });
+        navigation.Children.Add(new TextBlock { Text = "AviUtl2\nAltFactor", Foreground = System.Windows.Media.Brushes.White, FontSize = 22, FontWeight = FontWeights.Bold, Margin = new Thickness(20, 24, 8, 28) });
         foreach (var item in new[] { "ホーム", "字幕", "AI", "スタイル", "出力", "設定" })
             navigation.Children.Add(CreateNavigationButton(item));
         Grid.SetColumn(navigation, 0); root.Children.Add(navigation);
@@ -505,7 +519,12 @@ public sealed class FatWindow : Window
         details.Children.Add(new TextBlock { Text = "字幕言語:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_outputLanguage);
         details.Children.Add(new TextBlock { Text = "音声認識:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_recognitionProfile);
         details.Children.Add(new TextBlock { Text = "認識漏れ補正:", Margin = new Thickness(14, 0, 4, 0), VerticalAlignment = VerticalAlignment.Center }); details.Children.Add(_speechRecovery);
-        advanced.Content = details; home.Children.Add(advanced); _advancedSettings = advanced;
+        var advancedContent = new StackPanel(); advancedContent.Children.Add(details);
+        var diarizationRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
+        diarizationRow.Children.Add(new TextBlock { Text = "話者分離:", VerticalAlignment = VerticalAlignment.Center }); diarizationRow.Children.Add(_diarizationMode);
+        diarizationRow.Children.Add(new TextBlock { Text = "想定人数:", Margin = new Thickness(12, 0, 0, 0), VerticalAlignment = VerticalAlignment.Center }); diarizationRow.Children.Add(_expectedSpeakers);
+        diarizationRow.Children.Add(new TextBlock { Text = "（ローカルモデル未設定時は Speaker A）", Margin = new Thickness(10, 0, 0, 0), Foreground = System.Windows.Media.Brushes.DimGray, VerticalAlignment = VerticalAlignment.Center });
+        advancedContent.Children.Add(diarizationRow); advanced.Content = advancedContent; home.Children.Add(advanced); _advancedSettings = advanced;
 
         var previewPanel = CreatePreviewPanel();
         DockPanel.SetDock(previewPanel, Dock.Top);
@@ -622,12 +641,15 @@ public sealed class FatWindow : Window
         UpdateAiState();
         LoadPreviewSettings();
         LoadShortcutSettings();
+        LoadSpeakerSettings();
+        _diarizationMode.SelectionChanged += (_, _) => SaveSpeakerSettings();
+        _expectedSpeakers.SelectionChanged += (_, _) => SaveSpeakerSettings();
         ConfigurePreviewEvents();
         _draftAutosaveTimer.Tick += async (_, _) => await AutosaveDraftAsync();
         _draftAutosaveTimer.Start();
         SelectNavigation("ホーム");
-        Loaded += async (_, _) => await PromptDraftRecoveryAsync();
-        Closed += (_, _) => { SavePreviewSettings(); SaveShortcutSettings(); _draftAutosaveTimer.Stop(); _previewTimer.Stop(); _previewBackend.Close(); _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
+        Loaded += async (_, _) => { ShowBrandMigrationNoticeIfNeeded(); await PromptDraftRecoveryAsync(); };
+        Closed += (_, _) => { SavePreviewSettings(); SaveShortcutSettings(); SaveSpeakerSettings(); _draftAutosaveTimer.Stop(); _previewTimer.Stop(); _previewBackend.Close(); _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
     }
 
     private Border CreatePreviewPanel()
@@ -724,6 +746,31 @@ public sealed class FatWindow : Window
     {
         _shortcutSettings = ShortcutSettingsStore.LoadAsync(_shortcutSettingsPath, CancellationToken.None).GetAwaiter().GetResult();
         _shortcutManager = new ShortcutManager(_shortcutSettings);
+    }
+
+    private void LoadSpeakerSettings()
+    {
+        _speakerSettings = SpeakerSettingsStore.LoadAsync(_speakerSettingsPath, CancellationToken.None).GetAwaiter().GetResult();
+        var settings = _speakerSettings.Diarization ?? SpeakerDiarizationSettings.Disabled;
+        _diarizationMode.SelectedItem = _diarizationMode.Items.Cast<ComboBoxItem>().FirstOrDefault(item => string.Equals(item.Tag as string, settings.Mode, StringComparison.OrdinalIgnoreCase)) ?? _diarizationMode.Items[0];
+        _expectedSpeakers.SelectedItem = _expectedSpeakers.Items.Cast<ComboBoxItem>().FirstOrDefault(item => item.Tag is int value && value == settings.ExpectedSpeakers) ?? _expectedSpeakers.Items[0];
+    }
+
+    private SpeakerDiarizationSettings CurrentDiarizationSettings() => new SpeakerDiarizationSettings
+    {
+        Mode = (_diarizationMode.SelectedItem as ComboBoxItem)?.Tag as string ?? "off",
+        ExpectedSpeakers = (_expectedSpeakers.SelectedItem as ComboBoxItem)?.Tag as int? ?? 2,
+        ModelPath = _speakerSettings.Diarization?.ModelPath
+    }.Normalize();
+
+    private void SaveSpeakerSettings()
+    {
+        try
+        {
+            _speakerSettings = _speakerSettings with { Diarization = CurrentDiarizationSettings() };
+            SpeakerSettingsStore.SaveAsync(_speakerSettingsPath, _speakerSettings, CancellationToken.None).GetAwaiter().GetResult();
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException) { }
     }
 
     private void SaveShortcutSettings()
@@ -1088,13 +1135,15 @@ public sealed class FatWindow : Window
         });
         resetShortcut.Margin = new Thickness(0, 0, 0, 12);
         RefreshShortcutText(shortcutText);
+        var speakerSettings = AddButton(panel, "Speaker diarization / names", (_, _) => ShowSpeakerSettings(window));
+        speakerSettings.Margin = new Thickness(0, 0, 0, 8);
         var advanced = AddButton(panel, "認識の詳細設定を開く", (_, _) => { _advancedSettings?.SetCurrentValue(Expander.IsExpandedProperty, true); _recognitionLanguage.Focus(); window.Close(); });
         advanced.Margin = new Thickness(0, 0, 0, 8);
         var update = AddButton(panel, "更新を確認", async (_, _) => await CheckForUpdatesAsync());
         update.Margin = new Thickness(0, 0, 0, 8);
         var releases = AddButton(panel, "GitHub Releaseを開く", (_, _) => Process.Start(new ProcessStartInfo(ReleasesPageUrl) { UseShellExecute = true }));
         releases.Margin = new Thickness(0, 0, 0, 8);
-        var uninstall = AddButton(panel, "AviUtl2 FATをアンインストール...", (_, _) => StartUninstaller());
+        var uninstall = AddButton(panel, "AviUtl2 AltFactorをアンインストール...", (_, _) => StartUninstaller());
         uninstall.ToolTip = "FATのみを削除します。AviUtl2本体や他のプラグインには変更を加えません。";
         window.Content = new ScrollViewer
         {
@@ -1103,6 +1152,30 @@ public sealed class FatWindow : Window
             HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
             CanContentScroll = true
         };
+        window.ShowDialog();
+    }
+
+    private void ShowSpeakerSettings(Window owner)
+    {
+        var window = new Window { Title = "Speaker diarization", Owner = owner, Width = 500, Height = 390, WindowStartupLocation = WindowStartupLocation.CenterOwner };
+        var panel = new StackPanel { Margin = new Thickness(18) };
+        panel.Children.Add(new TextBlock { Text = "Optional local audio diarization", FontSize = 18, FontWeight = FontWeights.SemiBold });
+        panel.Children.Add(new TextBlock { Text = "FAT never downloads models. Select an already installed local pyannote model, otherwise Speaker A is used.", TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) });
+        var path = new TextBox { Text = _speakerSettings.Diarization?.ModelPath ?? string.Empty, MinWidth = 300 };
+        var pathRow = new StackPanel { Orientation = Orientation.Horizontal }; pathRow.Children.Add(path); AddButton(pathRow, "Browse", (_, _) => { var dialog = new OpenFileDialog { CheckFileExists = false }; if (dialog.ShowDialog(window) == true) path.Text = dialog.FileName; }); panel.Children.Add(pathRow);
+        panel.Children.Add(new TextBlock { Text = "Display names (ID and exported style stay unchanged)", FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 14, 0, 4) });
+        var names = new Dictionary<string, TextBox>();
+        foreach (var id in SpeakerIds.DefaultChoices)
+        {
+            var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 2, 0, 2) };
+            row.Children.Add(new TextBlock { Text = $"Speaker {id}", Width = 90, VerticalAlignment = VerticalAlignment.Center });
+            var box = new TextBox { Width = 220, Text = _speakerSettings.Profiles is not null && _speakerSettings.Profiles.TryGetValue(id, out var profile) ? profile.DisplayName ?? string.Empty : string.Empty };
+            names[id] = box; row.Children.Add(box); panel.Children.Add(row);
+        }
+        var buttons = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 14, 0, 0) };
+        AddButton(buttons, "Save", (_, _) => { var profiles = names.ToDictionary(pair => pair.Key, pair => new SpeakerProfile(pair.Key, pair.Value.Text)); _speakerSettings = new SpeakerSettingsDocument(CurrentDiarizationSettings() with { ModelPath = path.Text }, profiles).Normalize(); SaveSpeakerSettings(); window.Close(); });
+        AddButton(buttons, "Close", (_, _) => window.Close()); panel.Children.Add(buttons);
+        window.Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
         window.ShowDialog();
     }
 
@@ -1157,11 +1230,11 @@ public sealed class FatWindow : Window
         var uninstaller = pluginRoot is null ? null : Path.Combine(pluginRoot, "unins000.exe");
         if (string.IsNullOrWhiteSpace(uninstaller) || !File.Exists(uninstaller))
         {
-            MessageBox.Show(this, "アンインストーラーはインストール済みのFATにだけ含まれます。\n\n現在は開発版または展開フォルダーから実行されています。Windowsの「インストールされているアプリ」から AviUtl2 FAT を選んで削除するか、FATをインストーラーで導入してください。", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+            MessageBox.Show(this, "アンインストーラーはインストール済みのAltFactorにだけ含まれます。\n\n現在は開発版または展開フォルダーから実行されています。Windowsの「インストールされているアプリ」から AviUtl2 AltFactor を選んで削除するか、インストーラーで導入してください。", Title, MessageBoxButton.OK, MessageBoxImage.Information);
             return;
         }
 
-        var decision = MessageBox.Show(this, "AviUtl2 FAT をアンインストールしますか？\n\n削除対象は AviUtl2FAT フォルダー内の FAT 本体・Worker・runtime・ダウンロード済みモデルです。AviUtl2 本体、他のプラグイン、プロジェクトファイルには触れません。\n\nアプリ設定は %LOCALAPPDATA%\\AviUtl2FAT に残るため、再インストール時に引き継げます。", Title, MessageBoxButton.YesNo, MessageBoxImage.Warning);
+        var decision = MessageBox.Show(this, "AviUtl2 AltFactor をアンインストールしますか？\n\n削除対象は互換性維持用の AviUtl2FAT フォルダー内にある AltFactor 本体・Worker・runtime・ダウンロード済みモデルです。AviUtl2 本体、他のプラグイン、プロジェクトファイルには触れません。\n\nアプリ設定は %LOCALAPPDATA%\\AviUtl2FAT に残るため、再インストール時に引き継げます。", Title, MessageBoxButton.YesNo, MessageBoxImage.Warning);
         if (decision != MessageBoxResult.Yes) return;
 
         Process.Start(new ProcessStartInfo(uninstaller) { UseShellExecute = true, WorkingDirectory = pluginRoot! });
@@ -1180,32 +1253,24 @@ public sealed class FatWindow : Window
     {
         try
         {
-            using var response = await UpdateClient.GetAsync(ReleasesApiUrl);
-            response.EnsureSuccessStatusCode();
-            using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
-            var latest = document.RootElement.EnumerateArray()
-                .FirstOrDefault(release => !release.GetProperty("draft").GetBoolean());
-            if (latest.ValueKind == JsonValueKind.Undefined)
+            var latest = await GetLatestStableReleaseAsync();
+            if (latest is null)
             {
                 MessageBox.Show(this, "公開済みの更新情報はまだありません。", Title, MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
-            var tag = latest.GetProperty("tag_name").GetString() ?? "";
+            var tag = latest.Tag;
             var current = ParseVersion(CurrentVersion);
             var available = ParseVersion(tag);
             if (available is null || current is null || available.CompareTo(current) <= 0)
             {
-                MessageBox.Show(this, $"AviUtl2 FAT は最新です。\n\n現在: v{CurrentVersion}\n公開版: {tag}", Title, MessageBoxButton.OK, MessageBoxImage.Information);
+                MessageBox.Show(this, $"AviUtl2 AltFactor は最新です。\n\n現在: v{CurrentVersion}\n公開版: {tag}", Title, MessageBoxButton.OK, MessageBoxImage.Information);
                 return;
             }
 
-            var asset = latest.GetProperty("assets").EnumerateArray().FirstOrDefault(item =>
-                (item.GetProperty("name").GetString() ?? "").EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
-            var downloadUrl = asset.ValueKind == JsonValueKind.Undefined
-                ? latest.GetProperty("html_url").GetString()
-                : asset.GetProperty("browser_download_url").GetString();
-            var decision = MessageBox.Show(this, $"AviUtl2 FAT {tag} を利用できます。\n\n更新インストーラーを開きますか？\n実行中のAviUtl2 FATを閉じてからインストールしてください。", Title, MessageBoxButton.YesNo, MessageBoxImage.Information);
+            var downloadUrl = latest.InstallerUrl ?? latest.ReleasePageUrl;
+            var decision = MessageBox.Show(this, $"AviUtl2 AltFactor {tag} を利用できます。\n\n更新インストーラーを開きますか？\n実行中のAviUtl2 AltFactorを閉じてからインストールしてください。", Title, MessageBoxButton.YesNo, MessageBoxImage.Information);
             if (decision == MessageBoxResult.Yes && !string.IsNullOrWhiteSpace(downloadUrl))
                 Process.Start(new ProcessStartInfo(downloadUrl) { UseShellExecute = true });
         }
@@ -1214,6 +1279,50 @@ public sealed class FatWindow : Window
             MessageBox.Show(this, "更新情報を取得できませんでした。ネットワーク接続を確認するか、GitHub Releaseを開いてください。\n\n" + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Warning);
         }
     }
+
+    private static async Task<ReleaseCandidate?> GetLatestStableReleaseAsync()
+    {
+        Exception? lastFailure = null;
+        // New installations can use the AltFactor repository after a rename.
+        // The legacy endpoint remains a required fallback throughout V1 → V2 migration.
+        foreach (var endpoint in new[] { AltFactorReleasesApiUrl, LegacyReleasesApiUrl })
+        {
+            try
+            {
+                using var response = await UpdateClient.GetAsync(endpoint);
+                if (!response.IsSuccessStatusCode)
+                {
+                    lastFailure = new HttpRequestException($"Update endpoint returned {(int)response.StatusCode}: {endpoint}");
+                    continue;
+                }
+
+                using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync());
+                foreach (var release in document.RootElement.EnumerateArray())
+                {
+                    if (release.GetProperty("draft").GetBoolean() || release.GetProperty("prerelease").GetBoolean()) continue;
+                    var tag = release.GetProperty("tag_name").GetString() ?? string.Empty;
+                    if (ParseVersion(tag) is null) continue;
+
+                    var asset = release.GetProperty("assets").EnumerateArray().FirstOrDefault(item =>
+                        (item.GetProperty("name").GetString() ?? "").EndsWith(".exe", StringComparison.OrdinalIgnoreCase));
+                    var installerUrl = asset.ValueKind == JsonValueKind.Undefined
+                        ? null
+                        : asset.GetProperty("browser_download_url").GetString();
+                    return new ReleaseCandidate(tag, release.GetProperty("html_url").GetString() ?? ReleasesPageUrl, installerUrl);
+                }
+                return null;
+            }
+            catch (Exception error) when (error is HttpRequestException or TaskCanceledException or JsonException)
+            {
+                lastFailure = error;
+            }
+        }
+
+        if (lastFailure is not null) throw new InvalidOperationException("更新情報を取得できませんでした。", lastFailure);
+        return null;
+    }
+
+    private sealed record ReleaseCandidate(string Tag, string ReleasePageUrl, string? InstallerUrl);
 
     private static Version? ParseVersion(string value)
     {
@@ -1226,6 +1335,36 @@ public sealed class FatWindow : Window
         var version = typeof(FatWindow).Assembly.GetName().Version;
         return version is null ? "1.1" : version.Build == 0 ? $"{version.Major}.{version.Minor}" : version.ToString(3);
     }
+
+    private void ShowBrandMigrationNoticeIfNeeded()
+    {
+        if (ParseVersion(CurrentVersion) is not { Major: >= 2 } || File.Exists(_brandMigrationNoticePath) || !HasExistingFatUserData()) return;
+
+        MessageBox.Show(this,
+            "AviUtl2FATは「AviUtl2 AltFactor」へ生まれ変わりました。\n\n" +
+            "Local AI Factoryへの進化に伴い、V2.0よりブランド名をAviUtl2 AltFactorへ変更しました。\n" +
+            "これまでの設定やデータはそのまま利用できます。これは同じプロジェクトの後継バージョンであり、別アプリではありません。",
+            "AviUtl2 AltFactor V2.0 Stable",
+            MessageBoxButton.OK,
+            MessageBoxImage.Information);
+
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(_brandMigrationNoticePath)!);
+            File.WriteAllText(_brandMigrationNoticePath, "{\"shownFor\":\"2.0.0\"}", new UTF8Encoding(false));
+        }
+        catch (Exception error) when (error is IOException or UnauthorizedAccessException)
+        {
+            // A missing marker only means the non-destructive notice may be shown again.
+        }
+    }
+
+    private bool HasExistingFatUserData() =>
+        File.Exists(_aiSettingsPath) ||
+        File.Exists(_previewSettingsPath) ||
+        File.Exists(_shortcutSettingsPath) ||
+        File.Exists(_speakerSettingsPath) ||
+        Directory.Exists(_autosaveDirectory);
 
     private static ComboBox LanguageSelector(string selected, bool includeAuto = true) { var box = new ComboBox { Width = 130, Margin = new Thickness(0, 0, 0, 8) }; if (includeAuto) box.Items.Add(new ComboBoxItem { Content = "自動判定", Tag = "auto" }); box.Items.Add(new ComboBoxItem { Content = "日本語", Tag = "ja" }); box.Items.Add(new ComboBoxItem { Content = "English", Tag = "en" }); box.SelectedItem = box.Items.Cast<ComboBoxItem>().First(x => (string)x.Tag == selected); return box; }
     private static ComboBox RecognitionProfileSelector() { var box = new ComboBox { Width = 120, Margin = new Thickness(0, 0, 0, 8) }; foreach (var item in new[] { ("自動", "auto"), ("高速", "low"), ("標準", "standard"), ("高精度", "high") }) box.Items.Add(new ComboBoxItem { Content = item.Item1, Tag = item.Item2 }); box.SelectedIndex = 0; return box; }
@@ -1293,7 +1432,7 @@ public sealed class FatWindow : Window
             output = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", $"{Guid.NewGuid():N}.att.json");
             var recognitionLanguage = SelectedLanguage(_recognitionLanguage); var outputLanguage = SelectedLanguage(_outputLanguage);
             var recognitionTimer = Stopwatch.StartNew();
-            await RunWorkerAsync(new RecognitionRequest(_input, output, new FatSettings { Version = CurrentVersion, Language = recognitionLanguage, RecognitionLanguage = recognitionLanguage, CaptionOutputLanguage = outputLanguage, SpeechProfile = (string)((ComboBoxItem)_recognitionProfile.SelectedItem).Tag, SpeechRecoveryMode = (string)((ComboBoxItem)_speechRecovery.SelectedItem).Tag }), p => { _status.Text = p.Message; if (p.Value is not null) _progress.Value = Math.Clamp(p.Value.Value, 0, 100); }, _recognitionCancellation.Token);
+            await RunWorkerAsync(new RecognitionRequest(_input, output, new FatSettings { Version = CurrentVersion, Language = recognitionLanguage, RecognitionLanguage = recognitionLanguage, CaptionOutputLanguage = outputLanguage, SpeechProfile = (string)((ComboBoxItem)_recognitionProfile.SelectedItem).Tag, SpeechRecoveryMode = (string)((ComboBoxItem)_speechRecovery.SelectedItem).Tag, SpeakerDiarization = CurrentDiarizationSettings() }), p => { _status.Text = p.Message; if (p.Value is not null) _progress.Value = Math.Clamp(p.Value.Value, 0, 100); }, _recognitionCancellation.Token);
             recognitionTimer.Stop();
             var transcript = await FatFiles.ReadAttTranscriptAsync(output, _recognitionCancellation.Token);
             var shapingTimer = Stopwatch.StartNew();
@@ -1496,7 +1635,8 @@ public sealed class FatWindow : Window
         File.Exists(Path.Combine(runtime, "python", "fat_worker.py"));
 
     private FatDraft CreateDraft() => FatDraft.Create(_input, _draftDurationSeconds, _draftFramesPerSecond,
-        _captions.Select(row => row.ToCaption()).ToArray(), _style, _undo.Reverse().ToArray());
+        _captions.Select(row => row.ToCaption()).ToArray(), _style, _undo.Reverse().ToArray(), null,
+        new SpeakerProjectMetadata(CurrentDiarizationSettings(), _speakerSettings.Profiles));
 
     private void ScheduleDraftAutosave()
     {
@@ -1521,7 +1661,7 @@ public sealed class FatWindow : Window
     private async Task SaveDraftAsAsync()
     {
         if (_captions.Count == 0) { Error("FAT_DRAFT_EMPTY", "保存する字幕がありません。字幕を作成または作業ファイルを開いてください。"); return; }
-        var dialog = new SaveFileDialog { Filter = "AviUtl2 FAT 作業ファイル|*.fatdraft", FileName = $"FAT_Draft_{DateTime.Now:yyyyMMdd_HHmmss}" };
+        var dialog = new SaveFileDialog { Filter = "AviUtl2 AltFactor 作業ファイル|*.fatdraft", FileName = $"AltFactor_Draft_{DateTime.Now:yyyyMMdd_HHmmss}" };
         if (dialog.ShowDialog(this) != true) return;
         try
         {
@@ -1534,7 +1674,7 @@ public sealed class FatWindow : Window
 
     private async Task OpenDraftAsync()
     {
-        var dialog = new OpenFileDialog { Filter = "AviUtl2 FAT 作業ファイル|*.fatdraft" };
+        var dialog = new OpenFileDialog { Filter = "AviUtl2 AltFactor 作業ファイル|*.fatdraft" };
         if (dialog.ShowDialog(this) != true) return;
         await RestoreDraftAsync(dialog.FileName);
     }
@@ -1556,6 +1696,13 @@ public sealed class FatWindow : Window
             _draftDurationSeconds = draft.DurationSeconds;
             _draftFramesPerSecond = draft.FramesPerSecond;
             _style = draft.Style ?? AviUtl2TextStyle.Default;
+            if (draft.SpeakerMetadata is { } speakerMetadata)
+            {
+                _speakerSettings = _speakerSettings with { Diarization = (speakerMetadata.Diarization ?? SpeakerDiarizationSettings.Disabled).Normalize(), Profiles = speakerMetadata.Profiles };
+                var diarization = _speakerSettings.Diarization ?? SpeakerDiarizationSettings.Disabled;
+                _diarizationMode.SelectedItem = _diarizationMode.Items.Cast<ComboBoxItem>().FirstOrDefault(item => string.Equals(item.Tag as string, diarization.Mode, StringComparison.OrdinalIgnoreCase)) ?? _diarizationMode.Items[0];
+                _expectedSpeakers.SelectedItem = _expectedSpeakers.Items.Cast<ComboBoxItem>().FirstOrDefault(item => item.Tag is int count && count == diarization.ExpectedSpeakers) ?? _expectedSpeakers.Items[0];
+            }
             _undo.Clear();
             foreach (var snapshot in draft.UndoSnapshots ?? []) _undo.Push(snapshot);
             Load(draft.Captions);
@@ -1719,6 +1866,9 @@ public sealed class FatWindow : Window
             device = request.Settings.Device, compute_type = request.Settings.ComputeType,
             profile = request.Settings.SpeechProfile, audio_enhancement = request.Settings.AudioEnhancement,
             filler_mode = request.Settings.FillerMode, speech_recovery = request.Settings.SpeechRecoveryMode,
+            diarization_mode = request.Settings.SpeakerDiarization.Normalize().Mode,
+            diarization_expected_speakers = request.Settings.SpeakerDiarization.Normalize().ExpectedSpeakers,
+            diarization_model_path = request.Settings.SpeakerDiarization.Normalize().ModelPath,
             dictionary = string.Join(",", request.Settings.RecognitionDictionary), fps = request.Settings.Fps,
             ffmpeg, ffprobe, model_dir = request.Settings.ModelDirectory ?? Path.Combine(runtime, "models")
         }, JsonOptions);

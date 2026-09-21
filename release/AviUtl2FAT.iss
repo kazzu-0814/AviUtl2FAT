@@ -1,8 +1,8 @@
-#define AppName "AviUtl2 FAT"
+#define AppName "AviUtl2 AltFactor"
 #ifndef AppVersion
-  #define AppVersion "1.0.4"
+  #define AppVersion "2.0.0"
 #endif
-#define AppPublisher "AviUtl2 FAT Project"
+#define AppPublisher "AviUtl2 AltFactor Project"
 #ifndef SourcePayload
   #define SourcePayload "..\\dist\\AviUtl2FAT-1.0.0-x64\\Plugin\\AviUtl2FAT"
 #endif
@@ -12,10 +12,16 @@ AppId={{D63C1F27-3B64-4D1E-8C5F-6D908BDBA100}
 AppName={#AppName}
 AppVersion={#AppVersion}
 AppPublisher={#AppPublisher}
+VersionInfoCompany={#AppPublisher}
+VersionInfoDescription={#AppName} Installer
+VersionInfoProductName={#AppName}
+VersionInfoVersion={#AppVersion}.0
+VersionInfoProductVersion={#AppVersion}.0
+VersionInfoProductTextVersion={#AppVersion}
 DefaultDirName={code:GetFatPluginDirectory}
 DisableProgramGroupPage=yes
 OutputDir=..\dist
-OutputBaseFilename=AviUtl2FAT-Setup-{#AppVersion}-x64
+OutputBaseFilename=AviUtl2-AltFactor-Setup-{#AppVersion}-x64
 #ifdef SignToolName
 SignTool={#SignToolName}
 #endif
@@ -34,9 +40,9 @@ InfoBeforeFile=..\QUICKSTART.md
 Source: "{#SourcePayload}\*"; DestDir: "{code:GetFatPluginDirectory}"; Flags: recursesubdirs ignoreversion
 
 [Icons]
-Name: "{autoprograms}\AviUtl2 FAT"; Filename: "{code:GetFatPluginDirectory}\FAT\AviUtl2FAT.App.exe"
-Name: "{autoprograms}\AviUtl2 FAT をアンインストール"; Filename: "{uninstallexe}"
-Name: "{autodesktop}\AviUtl2 FAT"; Filename: "{code:GetFatPluginDirectory}\FAT\AviUtl2FAT.App.exe"; Tasks: desktopicon
+Name: "{autoprograms}\AviUtl2 AltFactor"; Filename: "{code:GetFatPluginDirectory}\FAT\AviUtl2FAT.App.exe"
+Name: "{autoprograms}\AviUtl2 AltFactor をアンインストール"; Filename: "{uninstallexe}"
+Name: "{autodesktop}\AviUtl2 AltFactor"; Filename: "{code:GetFatPluginDirectory}\FAT\AviUtl2FAT.App.exe"; Tasks: desktopicon
 
 [Tasks]
 Name: "desktopicon"; Description: "デスクトップにショートカットを作成する"; Flags: unchecked
@@ -47,7 +53,7 @@ var
 
 procedure InitializeWizard;
 begin
-  PluginPage := CreateInputDirPage(wpSelectDir, 'AviUtl2 Plugin フォルダー', 'AviUtl2のPluginフォルダーを指定してください', 'AviUtl2 FATだけをフォルダー内のAviUtl2FATサブフォルダーへ配置します。他のプラグインやプロジェクトには変更を加えません。', False, '');
+  PluginPage := CreateInputDirPage(wpSelectDir, 'AviUtl2 Plugin フォルダー', 'AviUtl2のPluginフォルダーを指定してください', 'AviUtl2 AltFactorだけをフォルダー内の既存AviUtl2FAT互換サブフォルダーへ配置します。他のプラグインやプロジェクトには変更を加えません。', False, '');
   PluginPage.Add('Plugin フォルダー:');
   if DirExists(ExpandConstant('{commonappdata}\aviutl2\Plugin')) then
     PluginPage.Values[0] := ExpandConstant('{commonappdata}\aviutl2\Plugin')

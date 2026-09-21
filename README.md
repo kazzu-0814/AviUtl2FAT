@@ -1,16 +1,31 @@
-# AviUtl2 FAT v1.0
+# AviUtl2 AltFactor
 
-Formation Auto Text (FAT) is an AviUtl2 companion for speech recognition, editable captions, and AviUtl2 text-object export. Recognition and optional AI output are always editable before export.
+**Formerly AviUtl2FAT**
 
-## v1.0 distribution
+AviUtl2FATは、Local AI Factoryへの進化に伴い「AviUtl2 AltFactor」へ名称を変更しました。別プロジェクトではなく、AviUtl2FATから継続して開発されているプロジェクトです。
+
+## V2.0 Stable — FATからの正式アップデート
+
+AviUtl2 AltFactor V2.0 Stable は、AviUtl2FAT V1.x の後継となる正式アップデートです。既存の設定・モデル設定・保存パス・作業データは、互換性のため維持される %LOCALAPPDATA%\\AviUtl2FAT からそのまま引き継がれます。
+
+V1.x ユーザーへの更新を確実に届けるため、V2.0 の移行期間中は既存の GitHub Releases 更新経路を維持します。新しいインストーラーの表示名とファイル名は AltFactor へ移行しますが、Windows の Upgrade GUID、AviUtl2 Plugin 配置先、内部 Worker／IPC 名は変更しません。
+
+AviUtl2 AltFactor（オルトファクター）は、音声認識、編集可能な字幕、ローカルAI、AviUtl2テキストオブジェクト出力を扱うLocal AI Factoryです。認識結果とAI出力は、常に出力前に編集できます。
+
+## V2.0 Stable distribution
 
 - Windows 10/11 x64 and AviUtl2 are supported.
 - The release build is .NET self-contained: users do not need .NET SDK, Rust, Cargo, Node.js, Git, or a system Python installation.
 - Whisper and Gemma model weights are intentionally not bundled and can only be acquired by an explicit Model Manager action.
-- The installer only places `AviUtl2FAT` under the user-selected AviUtl2 Plugin folder. It does not modify `.aup2` files, user projects, or other plugins.
+- The installer is named `AviUtl2-AltFactor-Setup-x.x.x-x64.exe`. For update compatibility it continues to place the payload in the existing `AviUtl2FAT` Plugin folder; it does not modify `.aup2` files, user projects, or other plugins.
+- The V2.0 Stable release asset is `AviUtl2-AltFactor-Setup-2.0.0-x64.exe`.
 - Logs and user settings remain in `%LOCALAPPDATA%\AviUtl2FAT`.
 
 For installation and normal use, read [QUICKSTART.md](QUICKSTART.md). For a pre-release gate and known release blockers, read [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
+
+## Developer installer verification
+
+The manually triggered GitHub Actions workflow `Build AltFactor Installer` restores and tests the .NET, Python, and Rust components, builds the Windows installer with the existing `package-v1.0.ps1` and Inno Setup pipeline, verifies its Windows metadata, and uploads only the installer plus its SHA-256 file. It does not create a tag or GitHub Release. The downloaded artifact must still pass a manual AviUtl2FAT V1.1.7 to AviUtl2 AltFactor V2.0 upgrade test before a Stable release is published.
 
 FAT (Formation Auto Text) は、ATT v0.6 の分離実行・Python/faster-whisper・FFmpeg の資産を参照して再構築した AviUtl2 向け字幕基盤です。C# 実行バイナリの逆コンパイルは行っていません。
 

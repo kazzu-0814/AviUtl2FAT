@@ -50,6 +50,11 @@ class ModelRegistry:
             "gemma-4-e4b-it": ModelDefinition("gemma-4-e4b-it", "Gemma 4 E4B", "Google", "google/gemma-4-E4B-it", "gemma-4-e4b-it", 18 * gb, "https://huggingface.co/google/gemma-4-E4B-it", recommended_ram_bytes=24 * gb, recommended_vram_bytes=16 * gb, supports_audio=True),
             "gemma-4-12b-it": ModelDefinition("gemma-4-12b-it", "Gemma 4 12B", "Google", "google/gemma-4-12B-it", "gemma-4-12b-it", 28 * gb, "https://huggingface.co/google/gemma-4-12B-it", recommended_ram_bytes=40 * gb, recommended_vram_bytes=24 * gb, supports_audio=True),
             "gemma-4-26b-a4b-it": ModelDefinition("gemma-4-26b-a4b-it", "Gemma 4 26B A4B", "Google", "google/gemma-4-26B-A4B-it", "gemma-4-26b-a4b-it", 55 * gb, "https://huggingface.co/google/gemma-4-26B-A4B-it", recommended_ram_bytes=72 * gb, recommended_vram_bytes=48 * gb),
+            # Metadata only. These entries never trigger a download; a user must
+            # explicitly place a compatible local model/runtime in the folder.
+            "llm-jp-3-1.8b-instruct": ModelDefinition("llm-jp-3-1.8b-instruct", "LLM-jp-3 1.8B Instruct", "LLM-jp", "llm-jp/llm-jp-3-1.8b-instruct", "llm-jp-3-1.8b-instruct", 4 * gb, "https://huggingface.co/llm-jp", architecture="LLM-jp", recommended_ram_bytes=8 * gb, recommended_vram_bytes=4 * gb, gated=False),
+            "llm-jp-3-3.7b-instruct": ModelDefinition("llm-jp-3-3.7b-instruct", "LLM-jp-3 3.7B Instruct", "LLM-jp", "llm-jp/llm-jp-3-3.7b-instruct", "llm-jp-3-3.7b-instruct", 8 * gb, "https://huggingface.co/llm-jp", architecture="LLM-jp", recommended_ram_bytes=16 * gb, recommended_vram_bytes=8 * gb, gated=False),
+            "llama-3-elyza-jp-8b-gguf": ModelDefinition("llama-3-elyza-jp-8b-gguf", "Llama-3-ELYZA-JP-8B (GGUF)", "ELYZA", "elyza/Llama-3-ELYZA-JP-8B-GGUF", "llama-3-elyza-jp-8b-gguf", 6 * gb, "https://huggingface.co/elyza", required_files=("*.gguf",), architecture="Llama 3", variant=ModelVariant.QUANTIZED, recommended_ram_bytes=16 * gb, recommended_vram_bytes=8 * gb, gated=False),
         }
     def get(self, model_id: str) -> ModelDefinition:
         if model_id not in self._items: raise ValueError(f"MODEL_UNKNOWN: {model_id}")
@@ -80,6 +85,13 @@ class DeviceManager:
                 result["cuda"] = bool(torch.cuda.is_available())
                 if result["cuda"]: result.update(selected="cuda", gpu=torch.cuda.get_device_name(0), vram_bytes=int(torch.cuda.get_device_properties(0).total_memory))
         except Exception: pass
+        if not result["cuda"]:
+            # A short, optional probe avoids importing torch just for UI status.
+            try:
+                output = subprocess.check_output(["nvidia-smi", "--query-gpu=name,memory.total", "--format=csv,noheader,nounits"], text=True, encoding="utf-8", timeout=2).splitlines()[0]
+                name, memory_mb = [part.strip() for part in output.split(",", 1)]
+                result.update(gpu=name, vram_bytes=int(memory_mb) * 1024 * 1024)
+            except Exception: pass
         DeviceManager._cached = result
         return dict(result)
 
@@ -109,11 +121,15 @@ class ModelManager:
     def validate(self, model_id: str) -> dict[str, object]:
         definition = self.registry.get(model_id); path = self.registry.path_for(definition)
         if not path.exists(): return {"valid": False, "state": ModelState.NOT_INSTALLED, "missing": list(definition.required_files), "path": str(path)}
-        missing = [file for file in definition.required_files if not (path / file).is_file()]
-        if not any((path / item).is_file() for item in ("processor_config.json", "preprocessor_config.json")): missing.append("processor configuration")
-        if not any((path / item).is_file() for item in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json")): missing.append("tokenizer configuration")
-        weights = list(path.glob("*.safetensors")) + list(path.glob("pytorch_model*.bin"))
-        if not missing and not weights: missing.append("model weights (*.safetensors or pytorch_model*.bin)")
+        missing = [file for file in definition.required_files if not (any(path.glob(file)) if "*" in file else (path / file).is_file())]
+        if definition.variant == ModelVariant.QUANTIZED:
+            weights = list(path.glob("*.gguf"))
+            if not weights: missing.append("GGUF model file")
+        else:
+            if not any((path / item).is_file() for item in ("processor_config.json", "preprocessor_config.json")): missing.append("processor configuration")
+            if not any((path / item).is_file() for item in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json")): missing.append("tokenizer configuration")
+            weights = list(path.glob("*.safetensors")) + list(path.glob("pytorch_model*.bin"))
+            if not weights: missing.append("model weights (*.safetensors or pytorch_model*.bin)")
         state = ModelState.INSTALLED if not missing else ModelState.INCOMPLETE; self._state[model_id] = state
         return {"valid": not missing, "state": state, "missing": missing, "path": str(path), "bytes": sum(p.stat().st_size for p in path.rglob("*") if p.is_file())}
     def compatibility(self, model_id: str) -> dict[str, object]:

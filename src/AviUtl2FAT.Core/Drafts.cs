@@ -13,16 +13,17 @@ public sealed record FatDraft(
     IReadOnlyList<FATCaption> Captions,
     AviUtl2TextStyle? Style = null,
     IReadOnlyList<IReadOnlyList<FATCaption>>? UndoSnapshots = null,
-    IReadOnlyDictionary<string, string>? SplitMetadata = null)
+    IReadOnlyDictionary<string, string>? SplitMetadata = null,
+    SpeakerProjectMetadata? SpeakerMetadata = null)
 {
     public const string FormatName = "AviUtl2 FAT Draft";
     public const int CurrentSchemaVersion = 1;
 
     public static FatDraft Create(string? mediaPath, double durationSeconds, double fps, IReadOnlyList<FATCaption> captions,
         AviUtl2TextStyle? style = null, IReadOnlyList<IReadOnlyList<FATCaption>>? undoSnapshots = null,
-        IReadOnlyDictionary<string, string>? splitMetadata = null) =>
+        IReadOnlyDictionary<string, string>? splitMetadata = null, SpeakerProjectMetadata? speakerMetadata = null) =>
         new(FormatName, CurrentSchemaVersion, DateTimeOffset.UtcNow, mediaPath, Math.Max(0, durationSeconds), fps > 0 ? fps : 30,
-            captions.Select(caption => caption.Validate()).ToArray(), style, undoSnapshots, splitMetadata);
+            captions.Select(caption => caption.Validate()).ToArray(), style, undoSnapshots, splitMetadata, speakerMetadata?.Normalize());
 
     public FatDraft Validate()
     {
@@ -30,7 +31,7 @@ public sealed record FatDraft(
             throw new FatException("FAT_DRAFT_UNSUPPORTED", "この作業ファイルの形式またはバージョンには対応していません。");
         if (DurationSeconds < 0 || FramesPerSecond <= 0 || Captions is null)
             throw new FatException("FAT_DRAFT_INVALID", "作業ファイルの動画情報または字幕情報が不正です。");
-        return this with { Captions = Captions.Select(caption => caption.Validate()).OrderBy(caption => caption.StartTime).ThenBy(caption => caption.EndTime).ToArray() };
+        return this with { Captions = Captions.Select(caption => caption.Validate()).OrderBy(caption => caption.StartTime).ThenBy(caption => caption.EndTime).ToArray(), SpeakerMetadata = SpeakerMetadata?.Normalize() };
     }
 }
 

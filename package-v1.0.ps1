@@ -10,15 +10,20 @@ param(
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
     [string]$SignToolPath,
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '1.1.5'
+    [string]$Version = '2.0.0'
 )
 
 $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 $dotnet = Join-Path $env:ProgramFiles 'dotnet\dotnet.exe'
 $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
+# Keep Cargo-generated build scripts out of the project directory.  On
+# Windows systems with application-control policies this is also less likely
+# to be treated as an untrusted executable location.  This cache is
+# regenerable and does not contain user settings, models, or project data.
+$cargoTarget = Join-Path $env:LOCALAPPDATA 'AviUtl2FAT\build-cache\cargo-target'
 $version = $Version
-$dist = Join-Path $root "dist\AviUtl2FAT-$version-x64"
+$dist = Join-Path $root "dist\AviUtl2-AltFactor-$version-x64"
 $payload = Join-Path $dist 'Plugin\AviUtl2FAT'
 $app = Join-Path $payload 'FAT'
 $workerPublish = Join-Path $dist '_worker-publish'
@@ -114,9 +119,9 @@ foreach ($workerLaunchFile in @('AviUtl2FAT.Worker.exe', 'AviUtl2FAT.Worker.dll'
     if (-not (Test-Path -LiteralPath $source)) { throw "Worker publish validation failed: $workerLaunchFile" }
     Copy-Item -LiteralPath $source -Destination (Join-Path $app $workerLaunchFile) -Force
 }
-& $cargo build --manifest-path (Join-Path $root 'plugin\Cargo.toml') --release
+& $cargo build --manifest-path (Join-Path $root 'plugin\Cargo.toml') --release --target-dir $cargoTarget
 if ($LASTEXITCODE -ne 0) { throw 'Rust plugin release build failed.' }
-Copy-Item -LiteralPath (Join-Path $root 'plugin\target\release\aviutl2_fat_plugin.dll') -Destination (Join-Path $payload 'AviUtl2FAT.aux2') -Force
+Copy-Item -LiteralPath (Join-Path $cargoTarget 'release\aviutl2_fat_plugin.dll') -Destination (Join-Path $payload 'AviUtl2FAT.aux2') -Force
 Copy-Item -LiteralPath (Join-Path $root 'plugin\package.txt') -Destination $payload -Force
 
 $runtime = Join-Path $app 'runtime'
@@ -154,7 +159,7 @@ if ($script:signTool) {
 }
 
 if (-not $SkipPortableArchive) {
-    Compress-Archive -Path (Join-Path $dist '*') -DestinationPath (Join-Path $root "dist\AviUtl2FAT-$version-x64-portable.zip") -Force
+    Compress-Archive -Path (Join-Path $dist '*') -DestinationPath (Join-Path $root "dist\AviUtl2-AltFactor-$version-x64-portable.zip") -Force
 }
 if ($BuildInstaller) {
     $iscc = @('C:\Program Files (x86)\Inno Setup 6\ISCC.exe', 'C:\Program Files\Inno Setup 6\ISCC.exe', (Join-Path $env:LOCALAPPDATA 'Programs\Inno Setup 6\ISCC.exe')) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -First 1
@@ -170,9 +175,9 @@ if ($BuildInstaller) {
     & $iscc @innoArguments
     if ($LASTEXITCODE -ne 0) { throw 'Inno Setup build failed.' }
     if ($script:signTool) {
-        $installer = Join-Path $root "dist\AviUtl2FAT-Setup-$version-x64.exe"
+        $installer = Join-Path $root "dist\AviUtl2-AltFactor-Setup-$version-x64.exe"
         $installerSignature = Get-AuthenticodeSignature -LiteralPath $installer
         if ($installerSignature.Status -ne 'Valid') { throw "Installer signature validation failed: $($installerSignature.Status)" }
     }
 }
-[pscustomobject]@{ Product = 'AviUtl2 FAT'; Version = $version; Payload = $payload; SelfContainedDotNet = $true; PortablePython = [bool]$BuildPortablePython; ModelsBundled = $false; CodeSigned = [bool]$script:signTool } | ConvertTo-Json
+[pscustomobject]@{ Product = 'AviUtl2 AltFactor'; Version = $version; Payload = $payload; SelfContainedDotNet = $true; PortablePython = [bool]$BuildPortablePython; ModelsBundled = $false; CodeSigned = [bool]$script:signTool } | ConvertTo-Json

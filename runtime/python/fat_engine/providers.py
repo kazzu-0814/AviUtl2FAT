@@ -57,13 +57,17 @@ class AIProvider(ABC):
     def shorten(self, captions, request): return self.generate(captions, request)
     def naturalize(self, captions, request): return self.generate(captions, request)
 
+class ILocalLlmProvider(AIProvider):
+    """Contract shared by Gemma, LLM-jp, ELYZA and future local backends."""
+    def runtime_status(self) -> dict[str, object]: raise NotImplementedError
+
 class PassthroughProvider(AIProvider):
     id = "passthrough"
     def generate(self, captions, request):
         language = str(request.get("output_language", request.get("outputLanguage", "ja")))
         return [Caption(x.id, x.start_time, x.end_time, x.original_transcript, x.text, self.id, None, x.confidence, x.detected_language, language).validate() for x in captions]
 
-class GemmaProvider(AIProvider):
+class GemmaProvider(ILocalLlmProvider):
     id = "gemma"
     def __init__(self, manager: ModelManager, backend: InferenceBackend) -> None: self.manager, self.backend = manager, backend
     @staticmethod
@@ -71,6 +75,7 @@ class GemmaProvider(AIProvider):
     def health_check(self) -> dict[str, object]:
         loaded = next((item.id for item in self.manager.registry.all() if self.manager.is_loaded(item.id)), None)
         return {"provider": self.id, "ready": loaded is not None, "model_id": loaded, "models": self.manager.status()}
+    def runtime_status(self) -> dict[str, object]: return self.health_check()
     def load(self, model_id: str = "gemma-4-e2b-it") -> dict[str, object]:
         definition = self.manager.registry.get(model_id)
         return self.manager.load_model(model_id, lambda path: self.backend.load(path, definition) or self.backend, enforce_memory=not isinstance(self.backend, FakeGemmaBackend))
