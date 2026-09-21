@@ -205,6 +205,8 @@ jobs:
             Write-Host "$label Length: $($text.Length)"
             Write-Host "$label UTF-16: $codePoints"
             Write-Host "$label UTF-8: $utf8"
+            $lastCodePoint = if ($text.Length -eq 0) { '<empty>' } else { 'U+{0:X4}' -f [int][char]$text[$text.Length - 1] }
+            Write-Host "$label Final UTF-16 code unit: $lastCodePoint"
           }
           Write-ProductNameDiagnostic 'Actual ProductName (raw)' $actualProductNameRaw
           Write-ProductNameDiagnostic 'Actual ProductName (trailing U+0020 removed)' $actualProductName
@@ -219,12 +221,39 @@ jobs:
           if (-not $productNameMatches) {
             throw "Unexpected Product Name: [$actualProductName]"
           }
-          $acceptedVersions = @($env:BUILD_VERSION, "$env:BUILD_VERSION.0")
-          if ($versionInfo.FileVersion -notin $acceptedVersions) {
-            throw "Unexpected File Version: $($versionInfo.FileVersion)"
+
+          # The .iss source explicitly emits VersionInfoVersion as 2.0.0.0
+          # and VersionInfoProductTextVersion as 2.0.0. Log raw resource values
+          # before applying the same U+0020-only trailing padding normalization.
+          $actualFileVersionRaw = [string]$versionInfo.FileVersion
+          $actualFileVersion = $actualFileVersionRaw.TrimEnd([char]' ')
+          $expectedFileVersion = "$env:BUILD_VERSION.0"
+          $actualProductVersionRaw = [string]$versionInfo.ProductVersion
+          $actualProductVersion = $actualProductVersionRaw.TrimEnd([char]' ')
+          $expectedProductVersion = $env:BUILD_VERSION
+          Write-ProductNameDiagnostic 'Actual FileVersion (raw)' $actualFileVersionRaw
+          Write-ProductNameDiagnostic 'Actual FileVersion (trailing U+0020 removed)' $actualFileVersion
+          Write-ProductNameDiagnostic 'Expected FileVersion' $expectedFileVersion
+          Write-Host "Actual FileVersion trailing U+0020 count: $($actualFileVersionRaw.Length - $actualFileVersion.Length)"
+          Write-ProductNameDiagnostic 'Actual ProductVersion (raw)' $actualProductVersionRaw
+          Write-ProductNameDiagnostic 'Actual ProductVersion (trailing U+0020 removed)' $actualProductVersion
+          Write-ProductNameDiagnostic 'Expected ProductVersion' $expectedProductVersion
+          Write-Host "Actual ProductVersion trailing U+0020 count: $($actualProductVersionRaw.Length - $actualProductVersion.Length)"
+          $fileVersionMatches = [string]::Equals(
+            $actualFileVersion,
+            $expectedFileVersion,
+            [StringComparison]::Ordinal)
+          $productVersionMatches = [string]::Equals(
+            $actualProductVersion,
+            $expectedProductVersion,
+            [StringComparison]::Ordinal)
+          Write-Host "FileVersion comparison: strict ordinal after trailing U+0020 removal=$fileVersionMatches"
+          Write-Host "ProductVersion comparison: strict ordinal after trailing U+0020 removal=$productVersionMatches"
+          if (-not $fileVersionMatches) {
+            throw "Unexpected File Version: [$actualFileVersion]"
           }
-          if ($versionInfo.ProductVersion -notin $acceptedVersions) {
-            throw "Unexpected Product Version: $($versionInfo.ProductVersion)"
+          if (-not $productVersionMatches) {
+            throw "Unexpected Product Version: [$actualProductVersion]"
           }
 
           $signature = Get-AuthenticodeSignature -LiteralPath $installerPath
