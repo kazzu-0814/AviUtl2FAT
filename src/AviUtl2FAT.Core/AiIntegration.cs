@@ -102,7 +102,7 @@ public sealed class CodexAppServerBackend(string? executablePath = null, TimeSpa
     {
         get
         {
-            var path = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", "codex-app-server");
+            var path = Path.Combine(Path.GetTempPath(), "AviUtl2AltFactor", "codex-app-server");
             Directory.CreateDirectory(path);
             return path;
         }
@@ -133,7 +133,7 @@ public sealed class CodexAppServerBackend(string? executablePath = null, TimeSpa
             start.ArgumentList.Add("app-server"); // official Codex App Server stdio transport
             _process = Process.Start(start) ?? throw new FatException("CODEX_APP_SERVER_START_FAILED", "Codex App Serverを開始できませんでした。");
             _writer = _process.StandardInput; _writer.AutoFlush = true; _reader = _process.StandardOutput; _stderr = _process.StandardError.ReadToEndAsync();
-            await RequestAsync("initialize", new { clientInfo = new { name = "aviutl2_fat", title = "AviUtl2 FAT", version = "1.0.0" } }, cancellationToken);
+            await RequestAsync("initialize", new { clientInfo = new { name = "aviutl2_altfactor", title = "AviUtl2 AltFactor", version = "2.0.2" } }, cancellationToken);
             await SendAsync(new { method = "initialized", @params = new { } }, cancellationToken);
             ConnectionState = CodexConnectionState.Connected;
         }
@@ -269,7 +269,7 @@ public sealed class CodexCliBackend(TimeSpan? timeout = null) : ICodexBackend
     {
         var status = await GetStatusAsync(cancellationToken);
         if (!status.IsAvailable || status.CliPath is null) throw new FatException("CODEX_UNAVAILABLE", status.Detail);
-        var output = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", $"codex-{Guid.NewGuid():N}.txt");
+        var output = Path.Combine(Path.GetTempPath(), "AviUtl2AltFactor", $"codex-{Guid.NewGuid():N}.txt");
         Directory.CreateDirectory(Path.GetDirectoryName(output)!);
         try
         {
@@ -417,7 +417,7 @@ public sealed class ClaudeCodeCliBackend(TimeSpan? timeout = null) : IClaudeCode
     public void ConfigureExecutablePath(string? path) => _executablePath = string.IsNullOrWhiteSpace(path) ? null : path;
     private static string WorkDirectory
     {
-        get { var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "claude-workspace"); Directory.CreateDirectory(path); return path; }
+        get { var path = ApplicationDataPaths.Current.Directory("claude-workspace"); Directory.CreateDirectory(path); return path; }
     }
     public async Task<ExternalCliStatus> GetStatusAsync(CancellationToken cancellationToken)
     {

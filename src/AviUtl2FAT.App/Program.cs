@@ -319,7 +319,7 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
 
     private async Task DecodeAndPlayAudioAsync(string input, TimeSpan position, int generation, CancellationToken cancellationToken)
     {
-        var audioDirectory = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", "preview-audio");
+        var audioDirectory = Path.Combine(Path.GetTempPath(), "AviUtl2AltFactor", "preview-audio");
         Directory.CreateDirectory(audioDirectory);
         var output = Path.Combine(audioDirectory, $"preview-{Guid.NewGuid():N}.wav");
         try
@@ -379,6 +379,7 @@ public sealed class FfmpegFramePreviewBackend : IVideoPreviewBackend
 
 public sealed class FatWindow : Window
 {
+    private readonly long _startupTimestamp = Stopwatch.GetTimestamp();
     private static readonly string CurrentVersion = GetCurrentVersion();
     // V1 clients have this legacy endpoint compiled in. Keep publishing V2.0
     // there until the V1 migration window has been explicitly closed.
@@ -434,12 +435,13 @@ public sealed class FatWindow : Window
     private readonly Stack<IReadOnlyList<FATCaption>> _undo = new();
     private AviUtl2ObjectTemplate _objectTemplate = AviUtl2ObjectTemplate.CreateStandard();
     private AviUtl2TextStyle _style = AviUtl2TextStyle.Default;
-    private readonly string _aiSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
-    private readonly string _previewSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "preview-settings.json");
-    private readonly string _shortcutSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "shortcut-settings.json");
-    private readonly string _speakerSettingsPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "speaker-settings.json");
-    private readonly string _autosaveDirectory = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "autosave");
-    private readonly string _brandMigrationNoticePath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "altfactor-v2-notice.json");
+    private readonly ApplicationDataPaths _dataPaths = ApplicationDataPaths.Current;
+    private readonly string _aiSettingsPath = ApplicationDataPaths.Current.File("ai-settings.json");
+    private readonly string _previewSettingsPath = ApplicationDataPaths.Current.File("preview-settings.json");
+    private readonly string _shortcutSettingsPath = ApplicationDataPaths.Current.File("shortcut-settings.json");
+    private readonly string _speakerSettingsPath = ApplicationDataPaths.Current.File("speaker-settings.json");
+    private readonly string _autosaveDirectory = ApplicationDataPaths.Current.Directory("autosave");
+    private readonly string _brandMigrationNoticePath = ApplicationDataPaths.Current.File("altfactor-v2-notice.json");
     private readonly DispatcherTimer _draftAutosaveTimer = new() { Interval = TimeSpan.FromSeconds(3) };
     private string? _input;
     private bool _isRecognizing;
@@ -648,7 +650,12 @@ public sealed class FatWindow : Window
         _draftAutosaveTimer.Tick += async (_, _) => await AutosaveDraftAsync();
         _draftAutosaveTimer.Start();
         SelectNavigation("ホーム");
-        Loaded += async (_, _) => { ShowBrandMigrationNoticeIfNeeded(); await PromptDraftRecoveryAsync(); };
+        ContentRendered += async (_, _) =>
+        {
+            Debug.WriteLine($"AltFactor startup UI ready in {Stopwatch.GetElapsedTime(_startupTimestamp).TotalMilliseconds:0} ms; data={_dataPaths.Environment}");
+            ShowBrandMigrationNoticeIfNeeded();
+            await PromptDraftRecoveryAsync();
+        };
         Closed += (_, _) => { SavePreviewSettings(); SaveShortcutSettings(); SaveSpeakerSettings(); _draftAutosaveTimer.Stop(); _previewTimer.Stop(); _previewBackend.Close(); _pythonEngine.Dispose(); _codexAppServer.Dispose(); };
     }
 
@@ -1429,7 +1436,7 @@ public sealed class FatWindow : Window
         try
         {
             _progress.Value = 0; _status.Text = "Starting worker...";
-            output = Path.Combine(Path.GetTempPath(), "AviUtl2FAT", $"{Guid.NewGuid():N}.att.json");
+            output = Path.Combine(Path.GetTempPath(), "AviUtl2AltFactor", $"{Guid.NewGuid():N}.att.json");
             var recognitionLanguage = SelectedLanguage(_recognitionLanguage); var outputLanguage = SelectedLanguage(_outputLanguage);
             var recognitionTimer = Stopwatch.StartNew();
             await RunWorkerAsync(new RecognitionRequest(_input, output, new FatSettings { Version = CurrentVersion, Language = recognitionLanguage, RecognitionLanguage = recognitionLanguage, CaptionOutputLanguage = outputLanguage, SpeechProfile = (string)((ComboBoxItem)_recognitionProfile.SelectedItem).Tag, SpeechRecoveryMode = (string)((ComboBoxItem)_speechRecovery.SelectedItem).Tag, SpeakerDiarization = CurrentDiarizationSettings() }), p => { _status.Text = p.Message; if (p.Value is not null) _progress.Value = Math.Clamp(p.Value.Value, 0, 100); }, _recognitionCancellation.Token);
@@ -1767,16 +1774,15 @@ public sealed class FatWindow : Window
         }
         catch (FatException exception) { Error(exception.Code, exception.Message); }
     }
-    private async Task ShowModelManagerAsync()
+    private Task ShowModelManagerAsync()
     {
         var window = new ModelManagerWindow(AppContext.BaseDirectory, _pythonEngine, _codexCli, _codexAppServer, _claudeCode);
         window.Owner = this;
-        try { await window.RefreshAsync(); }
-        catch (Exception error) { window.ShowRefreshFailure(error); }
         // The manager is always a child of the FAT main window.  It must never
         // become Application.MainWindow or leave the application without a visible owner.
         window.ShowDialog();
         Activate();
+        return Task.CompletedTask;
     }
     private void Undo()
     {
@@ -2019,11 +2025,21 @@ public sealed class ModelManagerWindow : Window
     private readonly ComboBox _codexBackend = new() { Width = 150, Margin = new Thickness(8, 0, 0, 0) };
     private readonly TextBlock _codexState = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
     private readonly TextBlock _claudeState = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
+    private bool _initialRefreshStarted;
     public ModelManagerWindow(string appBase, PersistentPythonWorker engine, CodexCliBackend codex, CodexAppServerBackend appServer, ClaudeCodeCliBackend claude)
     {
         _runtime = FindRuntime(appBase); _engine = engine; _codex = codex; _appServer = appServer; _claude = claude; Title = "AI / 音声モデル管理"; Width = 640; Height = 730; MinHeight = 520;
         var panel = new StackPanel { Margin = new Thickness(16) };
         Content = new ScrollViewer { Content = panel, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled };
+        ContentRendered += async (_, _) =>
+        {
+            if (_initialRefreshStarted) return;
+            _initialRefreshStarted = true;
+            var started = Stopwatch.GetTimestamp();
+            try { await RefreshAsync(); }
+            catch (Exception error) { ShowRefreshFailure(error); }
+            finally { Debug.WriteLine($"AltFactor model manager ready in {Stopwatch.GetElapsedTime(started).TotalMilliseconds:0} ms"); }
+        };
         panel.Children.Add(new TextBlock { Text = "音声認識", FontSize = 18 });
         panel.Children.Add(new TextBlock { Text = "OpenAI Whisper をベースにした音声認識\nBackend: faster-whisper\nモデル本体は、ここで明示的にダウンロードした場合だけ取得します。", TextWrapping = TextWrapping.Wrap });
         var speechRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(0, 8, 0, 0) };
@@ -2124,7 +2140,7 @@ public sealed class ModelManagerWindow : Window
         _claude.ConfigureExecutablePath(dialog.FileName);
         var status = await _claude.GetStatusAsync(CancellationToken.None);
         if (!status.IsAvailable) { _claude.ConfigureExecutablePath(null); MessageBox.Show(this, "選択したファイルは実行可能なClaude Code CLIとして確認できませんでした。\n\n" + status.Detail, Title, MessageBoxButton.OK, MessageBoxImage.Warning); return; }
-        var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
+        var path = ApplicationDataPaths.Current.File("ai-settings.json");
         var current = await AiSelectionSettingsStore.LoadAsync(path, CancellationToken.None);
         await AiSelectionSettingsStore.SaveAsync(path, current with { ClaudeCliPath = dialog.FileName }, CancellationToken.None);
         await RefreshClaudeAsync();
@@ -2164,7 +2180,7 @@ public sealed class ModelManagerWindow : Window
             MessageBox.Show(this, "選択したファイルは実行可能なCodex CLIとして確認できませんでした。\n\n" + status.Detail, Title, MessageBoxButton.OK, MessageBoxImage.Warning);
             return;
         }
-        var path = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "AviUtl2FAT", "ai-settings.json");
+        var path = ApplicationDataPaths.Current.File("ai-settings.json");
         var current = await AiSelectionSettingsStore.LoadAsync(path, CancellationToken.None);
         await AiSelectionSettingsStore.SaveAsync(path, current with { CodexCliPath = dialog.FileName }, CancellationToken.None);
         _appServer.ConfigureExecutablePath(dialog.FileName);
@@ -2314,7 +2330,22 @@ public sealed class ModelManagerWindow : Window
     }
     private async Task ValidateAsync() { _state.Text = "状態: 確認中..."; _state.Text = "確認結果: " + await RunModelCommandAsync("model.validate", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}"); await RefreshAsync(); }
     private async Task LoadAsync() { _state.Text = "状態: モデルを読み込み中..."; _state.Text = "読み込み結果: " + await RunModelCommandAsync("model.load", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}"); await RefreshAsync(); }
-    private Task<string> RunModelCommandAsync(string type, string payload, Action<string>? progress = null) => _engine.RequestAsync(_runtime, type, payload, progress);
+    private async Task<string> RunModelCommandAsync(string type, string payload, Action<string>? progress = null)
+    {
+        var response = await _engine.RequestAsync(_runtime, type, payload, progress);
+        using var document = JsonDocument.Parse(response);
+        var root = document.RootElement;
+        if (root.TryGetProperty("type", out var responseType) && responseType.GetString() == "error")
+        {
+            var error = root.TryGetProperty("error", out var errorElement) ? errorElement : default;
+            var code = error.ValueKind == JsonValueKind.Object && error.TryGetProperty("code", out var codeElement)
+                ? codeElement.GetString() : null;
+            var message = error.ValueKind == JsonValueKind.Object && error.TryGetProperty("message", out var messageElement)
+                ? messageElement.GetString() : null;
+            throw new FatException(code ?? "FAT_MODEL_ERROR", message ?? "The local AI model operation failed.");
+        }
+        return response;
+    }
     private async Task DownloadAsync()
     {
         var item = SelectedGemma;

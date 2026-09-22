@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "aviutl2-fat-plugin"
-version = "1.0.0"
+version = "2.0.2"
 dependencies = [
  "aviutl2",
  "windows-sys",

@@ -38,5 +38,5 @@ Get-ChildItem -LiteralPath $SpeechSitePackages -Force |
 
 Remove-Item -LiteralPath (Join-Path $Destination 'pyvenv.cfg') -Force -ErrorAction SilentlyContinue
 $python = Join-Path $Destination 'python.exe'
-& $python -c "import av, ctranslate2, faster_whisper, numpy, onnxruntime; print('FAT portable speech runtime OK')"
-if ($LASTEXITCODE -ne 0) { throw 'The generated portable Python runtime did not pass its import check.' }
+& $python -c "import av, ctranslate2, faster_whisper, huggingface_hub, numpy, onnxruntime; print('AltFactor portable speech and model-download runtime OK')"
+if ($LASTEXITCODE -ne 0) { throw 'The generated portable Python runtime did not include the required speech and model-download dependencies.' }

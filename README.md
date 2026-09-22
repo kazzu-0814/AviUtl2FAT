@@ -14,12 +14,28 @@ AviUtl2 AltFactor（オルトファクター）は、音声認識、編集可能
 
 ## V2.0 Stable distribution
 
+### V2.0.2 bug-fix and stability update
+
+- Gemma 4 downloads now use the `huggingface_hub` library already present in the optional Python runtime instead of assuming that an `hf` command-line executable exists.
+- An interrupted Gemma download remains in its model directory and can be retried; access-denied and runtime-missing errors are returned as actionable messages without crashing AltFactor.
+- The installer creates the canonical AltFactor shortcuts without numbered duplicates. During an upgrade, it removes only the canonical legacy `AviUtl2 FAT.lnk` in the standard Start Menu or Desktop location, and only after it verifies both that link and its new AltFactor replacement point to this installation.
+- Existing FAT plugin folders, AppData, models, and other user data are not renamed, moved, or deleted.
+
+### V2.0.1 transition and performance update
+
+- A clean installation now uses the `AviUtl2-AltFactor` plugin directory and `%LOCALAPPDATA%\AviUtl2AltFactor` for new persistent data.
+- An existing `AviUtl2FAT` plugin or AppData directory is detected and used in place without renaming, copying, deleting, or redownloading models.
+- The AI / speech model manager renders first and starts model/runtime checks after the window becomes visible.
+- AI backends and the Python worker remain inactive until a user invokes an AI, model-management, or recognition operation.
+- V2.1 Control Mode foundations are isolated in interfaces and a lightweight orchestration service; V2.0.1 does not start Control Mode or an AI model at startup.
+- Compatibility identifiers, including the installer AppId and internal executable names, remain unchanged.
+
 - Windows 10/11 x64 and AviUtl2 are supported.
 - The release build is .NET self-contained: users do not need .NET SDK, Rust, Cargo, Node.js, Git, or a system Python installation.
 - Whisper and Gemma model weights are intentionally not bundled and can only be acquired by an explicit Model Manager action.
-- The installer is named `AviUtl2-AltFactor-Setup-x.x.x-x64.exe`. For update compatibility it continues to place the payload in the existing `AviUtl2FAT` Plugin folder; it does not modify `.aup2` files, user projects, or other plugins.
+- The installer is named `AviUtl2-AltFactor-Setup-x.x.x-x64.exe`. It preserves an existing `AviUtl2FAT` Plugin folder and uses `AviUtl2-AltFactor` only for a clean installation; it does not modify `.aup2` files, user projects, or other plugins.
 - The V2.0 Stable release asset is `AviUtl2-AltFactor-Setup-2.0.0-x64.exe`.
-- Logs and user settings remain in `%LOCALAPPDATA%\AviUtl2FAT`.
+- Existing logs and user settings remain in `%LOCALAPPDATA%\AviUtl2FAT`; a clean V2.0.1 installation uses `%LOCALAPPDATA%\AviUtl2AltFactor`.
 
 For installation and normal use, read [QUICKSTART.md](QUICKSTART.md). For a pre-release gate and known release blockers, read [RELEASE_CHECKLIST.md](RELEASE_CHECKLIST.md) and [THIRD_PARTY_NOTICES.txt](THIRD_PARTY_NOTICES.txt).
 

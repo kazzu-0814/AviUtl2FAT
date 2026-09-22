@@ -19,7 +19,7 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
-from fat_engine.model_manager import ModelManager
+from fat_engine.model_manager import ModelDownloadError, ModelManager
 from att_engine.progress import set_callback
 from att_engine.recognition_service import RecognitionService
 
@@ -122,6 +122,8 @@ def main() -> int:
             elif message_type in {"ai.generate", "ai.rewrite", "ai.shorten", "ai.naturalize"}: generate(message, registry)
             elif message.get("type") == "speech.recognize": recognize(message, recognition)
             else: raise ValueError("unsupported command")
+        except ModelDownloadError as error:
+            emit("error", message.get("id") if "message" in locals() else None, error={"code": error.code, "message": str(error)})
         except Exception as error:
             emit("error", message.get("id") if "message" in locals() else None, error={"code": "FAT_PYTHON_ERROR", "message": str(error)})
     return 0

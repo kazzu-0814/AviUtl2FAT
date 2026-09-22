@@ -1,6 +1,6 @@
 #define AppName "AviUtl2 AltFactor"
 #ifndef AppVersion
-  #define AppVersion "2.0.0"
+  #define AppVersion "2.0.2"
 #endif
 #define AppPublisher "AviUtl2 AltFactor Project"
 #ifndef SourcePayload
@@ -79,14 +79,76 @@ begin
     Result := ExpandConstant('{param:PLUGIN_DIR|}');
 end;
 
+function SelectAltFactorPluginDirectory(BaseDirectory: String): String;
+begin
+  { Never move an existing FAT installation. A clean install receives the new name. }
+  if DirExists(AddBackslash(BaseDirectory) + 'AviUtl2-AltFactor') then
+    Result := AddBackslash(BaseDirectory) + 'AviUtl2-AltFactor'
+  else if DirExists(AddBackslash(BaseDirectory) + 'AviUtl2FAT') then
+    Result := AddBackslash(BaseDirectory) + 'AviUtl2FAT'
+  else
+    Result := AddBackslash(BaseDirectory) + 'AviUtl2-AltFactor';
+end;
+
 function GetFatPluginDirectory(Param: String): String;
 begin
   if GetRequestedPluginDirectory <> '' then
-    Result := AddBackslash(GetRequestedPluginDirectory) + 'AviUtl2FAT'
+    Result := SelectAltFactorPluginDirectory(GetRequestedPluginDirectory)
   else if PluginPage <> nil then
-    Result := AddBackslash(PluginPage.Values[0]) + 'AviUtl2FAT'
+    Result := SelectAltFactorPluginDirectory(PluginPage.Values[0])
   else if DirExists(ExpandConstant('{commonappdata}\aviutl2\Plugin')) then
-    Result := ExpandConstant('{commonappdata}\aviutl2\Plugin\AviUtl2FAT')
+    Result := SelectAltFactorPluginDirectory(ExpandConstant('{commonappdata}\aviutl2\Plugin'))
   else
-    Result := ExpandConstant('{userappdata}\aviutl2\Plugin\AviUtl2FAT');
+    Result := SelectAltFactorPluginDirectory(ExpandConstant('{userappdata}\aviutl2\Plugin'));
+end;
+
+function ExpectedApplicationPath: String;
+begin
+  Result := ExpandFileName(AddBackslash(GetFatPluginDirectory('')) + 'FAT\AviUtl2FAT.App.exe');
+end;
+
+function ShortcutTargetsCurrentApplication(const ShortcutPath: String): Boolean;
+var
+  Shell, Shortcut: Variant;
+  TargetPath: String;
+begin
+  Result := False;
+  if not FileExists(ShortcutPath) then
+    exit;
+  try
+    Shell := CreateOleObject('WScript.Shell');
+    Shortcut := Shell.CreateShortcut(ShortcutPath);
+    TargetPath := ExpandFileName(Shortcut.TargetPath);
+    Result := CompareText(TargetPath, ExpectedApplicationPath) = 0;
+  except
+    Log('Could not inspect shortcut: ' + ShortcutPath);
+  end;
+end;
+
+procedure ReplaceLegacyShortcut(const LegacyPath, AltFactorPath: String);
+begin
+  { Only the canonical old installer shortcut in a standard location is
+    considered.  A same-named link is removed only after an AltFactor link is
+    present and points to this installation's executable. }
+  if not ShortcutTargetsCurrentApplication(LegacyPath) then
+    exit;
+  if not ShortcutTargetsCurrentApplication(AltFactorPath) then begin
+    Log('Keeping legacy shortcut because the new shortcut was not verified: ' + LegacyPath);
+    exit;
+  end;
+  if DeleteFile(LegacyPath) then
+    Log('Replaced legacy FAT shortcut: ' + LegacyPath)
+  else
+    Log('Could not remove legacy FAT shortcut: ' + LegacyPath);
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+begin
+  if CurStep = ssPostInstall then begin
+    ReplaceLegacyShortcut(ExpandConstant('{autoprograms}\AviUtl2 FAT.lnk'),
+      ExpandConstant('{autoprograms}\AviUtl2 AltFactor.lnk'));
+    if WizardIsTaskSelected('desktopicon') then
+      ReplaceLegacyShortcut(ExpandConstant('{autodesktop}\AviUtl2 FAT.lnk'),
+        ExpandConstant('{autodesktop}\AviUtl2 AltFactor.lnk'));
+  end;
 end;

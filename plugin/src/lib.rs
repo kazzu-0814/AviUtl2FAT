@@ -142,7 +142,17 @@ fn module_path() -> Option<PathBuf> {
 }
 fn log(message: &str) {
     if let Some(root) = std::env::var_os("LOCALAPPDATA") {
-        let dir = PathBuf::from(root).join("AviUtl2FAT").join("logs");
+        let local = PathBuf::from(root);
+        let altfactor = local.join("AviUtl2AltFactor");
+        let legacy = local.join("AviUtl2FAT");
+        let data = if altfactor.is_dir() {
+            altfactor
+        } else if legacy.is_dir() {
+            legacy
+        } else {
+            altfactor
+        };
+        let dir = data.join("logs");
         if fs::create_dir_all(&dir).is_ok() {
             if let Ok(mut file) = OpenOptions::new()
                 .create(true)

@@ -10,7 +10,7 @@ param(
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
     [string]$SignToolPath,
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.0.0'
+    [string]$Version = '2.0.2'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -21,7 +21,7 @@ $cargo = Join-Path $env:USERPROFILE '.cargo\bin\cargo.exe'
 # Windows systems with application-control policies this is also less likely
 # to be treated as an untrusted executable location.  This cache is
 # regenerable and does not contain user settings, models, or project data.
-$cargoTarget = Join-Path $env:LOCALAPPDATA 'AviUtl2FAT\build-cache\cargo-target'
+$cargoTarget = Join-Path $env:LOCALAPPDATA 'AviUtl2AltFactor\build-cache\cargo-target'
 $version = $Version
 $dist = Join-Path $root "dist\AviUtl2-AltFactor-$version-x64"
 $payload = Join-Path $dist 'Plugin\AviUtl2FAT'

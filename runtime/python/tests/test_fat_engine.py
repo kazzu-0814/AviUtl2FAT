@@ -8,7 +8,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fat_engine.models import Caption
-from fat_engine.model_manager import ModelManager, ModelState, ModelRecommendation
+from fat_engine.model_manager import HuggingFaceModelDownloader, ModelDownloadError, ModelManager, ModelState, ModelRecommendation
 from fat_engine.providers import FakeGemmaBackend, GemmaProvider, OutputValidator, PromptTemplates, ProviderRegistry
 
 
@@ -35,6 +35,39 @@ class FatEngineTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             manager = ModelManager(Path(folder))
             self.assertTrue({"google/gemma-4-E2B-it", "google/gemma-4-E4B-it", "google/gemma-4-12B-it", "google/gemma-4-26B-A4B-it"}.issubset({item.source for item in manager.registry.all()}))
+
+    def test_gemma_download_uses_installed_huggingface_library_and_validates_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder)
+            calls = []
+            def snapshot_download(*, repo_id, local_dir):
+                calls.append((repo_id, Path(local_dir)))
+                local_dir = Path(local_dir)
+                local_dir.mkdir(parents=True, exist_ok=True)
+                for name in ("config.json", "processor_config.json", "tokenizer_config.json", "model.safetensors"):
+                    (local_dir / name).write_text("{}", encoding="utf-8")
+                return str(local_dir)
+            manager = ModelManager(root, downloader=HuggingFaceModelDownloader(snapshot_download),
+                                   device_status=lambda: {"cuda": False, "selected": "cpu", "ram_available_bytes": 100_000_000_000, "vram_bytes": None})
+            with patch("fat_engine.model_manager.shutil.disk_usage", return_value=SimpleNamespace(free=100_000_000_000)):
+                result = manager.download("gemma-4-e2b-it", lambda _: None, lambda: False)
+            self.assertEqual([("google/gemma-4-E2B-it", root / "gemma-4-e2b-it")], calls)
+            self.assertTrue(result["valid"])
+            self.assertEqual(ModelState.INSTALLED, result["state"])
+
+    def test_gemma_download_surfaces_access_denial_without_deleting_partial_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            root = Path(folder); partial = root / "gemma-4-e2b-it"; partial.mkdir()
+            marker = partial / "partial-download.marker"; marker.write_text("keep", encoding="utf-8")
+            class Denied(Exception):
+                response = SimpleNamespace(status_code=403)
+            manager = ModelManager(root, downloader=HuggingFaceModelDownloader(lambda **_: (_ for _ in ()).throw(Denied())),
+                                   device_status=lambda: {"cuda": False, "selected": "cpu", "ram_available_bytes": 100_000_000_000, "vram_bytes": None})
+            with patch("fat_engine.model_manager.shutil.disk_usage", return_value=SimpleNamespace(free=100_000_000_000)):
+                with self.assertRaisesRegex(ModelDownloadError, "Accept its Hugging Face terms"):
+                    manager.download("gemma-4-e2b-it", lambda _: None, lambda: False)
+            self.assertTrue(marker.is_file())
+            self.assertEqual(ModelState.INCOMPLETE, manager.status("gemma-4-e2b-it")["state"])
 
     def test_local_registry_includes_opt_in_japanese_models(self):
         with tempfile.TemporaryDirectory() as folder:

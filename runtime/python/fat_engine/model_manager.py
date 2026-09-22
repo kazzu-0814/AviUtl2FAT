@@ -3,7 +3,6 @@ from __future__ import annotations
 import gc
 import os
 import shutil
-import subprocess
 import sys
 from dataclasses import asdict, dataclass
 from enum import StrEnum
@@ -22,6 +21,13 @@ class ModelVariant(StrEnum):
 
 class ModelRecommendation(StrEnum):
     RECOMMENDED = "Recommended"; POSSIBLE = "Possible"; NOT_RECOMMENDED = "NotRecommended"; UNSUPPORTED = "Unsupported"
+
+
+class ModelDownloadError(RuntimeError):
+    """A download failure that can be shown to the user without losing its cause."""
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 @dataclass(frozen=True)
@@ -101,17 +107,45 @@ class IModelDownloader:
 
 
 class HuggingFaceModelDownloader(IModelDownloader):
-    """Uses only the user's existing Hugging Face login; invoked solely by model.download."""
+    """Downloads only on an explicit command, using the installed Python runtime.
+
+    The portable runtime has the ``huggingface_hub`` package, but does not
+    guarantee a separately installed ``hf.exe`` command.  Calling the library
+    also keeps the existing Hugging Face login/token behaviour intact.
+    """
+    def __init__(self, snapshot_download: Callable[..., object] | None = None) -> None:
+        self._snapshot_download = snapshot_download
+
     def download(self, definition, destination, progress, cancel) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
-        cli = Path(sys.executable).parent / ("hf.exe" if os.name == "nt" else "hf")
-        process = subprocess.Popen([str(cli) if cli.is_file() else "hf", "download", definition.source, "--local-dir", str(destination)], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
-        assert process.stdout is not None
-        for line in process.stdout:
-            if cancel(): process.terminate(); process.wait(timeout=10); raise RuntimeError("MODEL_DOWNLOAD_CANCELLED")
-            downloaded = sum(item.stat().st_size for item in destination.rglob("*") if item.is_file()) if destination.exists() else 0
-            progress({"state": ModelState.DOWNLOADING, "message": line.strip(), "current_file": None, "downloaded_bytes": downloaded, "total_bytes": definition.estimated_download_bytes, "percent": min(99.0, downloaded * 100.0 / definition.estimated_download_bytes)})
-        if process.wait() != 0: raise RuntimeError("MODEL_DOWNLOAD_FAILED: confirm Hugging Face access conditions and sign-in")
+        if cancel():
+            raise ModelDownloadError("MODEL_DOWNLOAD_CANCELLED", "Model download was cancelled.")
+        progress({"state": ModelState.DOWNLOADING, "message": "Connecting to Hugging Face...", "current_file": None,
+                  "downloaded_bytes": 0, "total_bytes": definition.estimated_download_bytes, "percent": 0.0})
+        try:
+            snapshot_download = self._snapshot_download
+            if snapshot_download is None:
+                from huggingface_hub import snapshot_download as installed_snapshot_download
+                snapshot_download = installed_snapshot_download
+        except ImportError as error:
+            raise ModelDownloadError("MODEL_DOWNLOAD_RUNTIME_MISSING", "Hugging Face download support is missing. Reinstall the AltFactor Python runtime.") from error
+        try:
+            # local_dir preserves an interrupted download in its intended
+            # destination so Hugging Face can resume it.  No model is loaded
+            # by this operation, preserving lazy-loading at application start.
+            snapshot_download(repo_id=definition.source, local_dir=destination)
+        except Exception as error:
+            response = getattr(error, "response", None)
+            status_code = getattr(response, "status_code", None)
+            if status_code in (401, 403):
+                raise ModelDownloadError("MODEL_ACCESS_DENIED", "Access to this Gemma model was denied. Accept its Hugging Face terms and sign in, then retry.") from error
+            raise ModelDownloadError("MODEL_DOWNLOAD_FAILED", f"Model download failed: {error}") from error
+        if cancel():
+            raise ModelDownloadError("MODEL_DOWNLOAD_CANCELLED", "Model download was cancelled.")
+        downloaded = sum(item.stat().st_size for item in destination.rglob("*") if item.is_file()) if destination.exists() else 0
+        progress({"state": ModelState.DOWNLOADING, "message": "Verifying downloaded model files...", "current_file": None,
+                  "downloaded_bytes": downloaded, "total_bytes": definition.estimated_download_bytes,
+                  "percent": min(99.0, downloaded * 100.0 / definition.estimated_download_bytes)})
 
 
 class ModelManager:

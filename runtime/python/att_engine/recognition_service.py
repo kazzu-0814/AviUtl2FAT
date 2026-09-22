@@ -48,7 +48,7 @@ class RecognitionService:
         cached = self._audio_cache.get(source_key)
         if cached is not None and cached.is_file() and cached.stat().st_size > 44:
             return cached
-        cache_dir = Path(tempfile.gettempdir()) / "AviUtl2FAT" / "recognition-audio-cache"
+        cache_dir = Path(tempfile.gettempdir()) / "AviUtl2AltFactor" / "recognition-audio-cache"
         cache_dir.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256("\0".join(map(str, source_key)).encode("utf-8")).hexdigest()[:24]
         output = cache_dir / f"{digest}.wav"
