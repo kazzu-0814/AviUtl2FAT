@@ -14,6 +14,17 @@ AviUtl2 AltFactor（オルトファクター）は、音声認識、編集可能
 
 ## V2.0 Stable distribution
 
+### V2.0.3 stability and optimization update
+
+- Gemma 4 model downloads now report distinct connection, authentication, metadata, download, verification, and installation phases, with transferred-byte progress during weight retrieval.
+- Per-model operation locking prevents GUI and PowerShell diagnostics from downloading the same model concurrently; cancelled downloads retain reusable cache data and can be retried safely.
+- The included `Test-AltFactorGemma.ps1` diagnostic verifies Hugging Face access and can probe a real Gemma weight transfer without requiring a full model download.
+- Gemma 4 E2B has been verified through Hugging Face metadata and weight access, PowerShell diagnostics, and local subtitle generation from the AltFactor UI.
+- The model-management window now cancels outstanding status checks and model operations when it closes, so stale work cannot update a later window instance.
+- Gemma load, validation, and download operations have explicit cancellation and retry-safe failure states; an AI error leaves the rest of AltFactor usable.
+- The persistent Python worker continuously drains and bounds retained stderr diagnostics, preventing an unusually noisy native dependency from consuming unbounded memory or blocking its pipe.
+- Model unload no longer forces a full Python garbage collection, avoiding an unnecessary UI-visible worker stall.
+
 ### V2.0.2 bug-fix and stability update
 
 - Gemma 4 downloads now use the `huggingface_hub` library already present in the optional Python runtime instead of assuming that an `hf` command-line executable exists.

@@ -1996,13 +1996,13 @@ public sealed class ModelManagerWindow : Window
         new("base", "Whisper Base", "Systran/faster-whisper-base", "低負荷・初回導入向け"),
         new("small", "Whisper Small", "Systran/faster-whisper-small", "標準精度・通常はこちら")
     ];
-    private sealed record GemmaCard(string Id, string Name, string Source, double DiskGb, int RamGb, int VramGb);
+    private sealed record GemmaCard(string Id, string Name, string Source, double DiskGb, string ModelClass, string Tier, string MemoryGuide, string HardwareGuide);
     private static readonly GemmaCard[] GemmaModels =
     [
-        new("gemma-4-e2b-it", "Gemma 4 E2B", "google/gemma-4-E2B-it", 10.3, 16, 12),
-        new("gemma-4-e4b-it", "Gemma 4 E4B", "google/gemma-4-E4B-it", 18, 24, 16),
-        new("gemma-4-12b-it", "Gemma 4 12B", "google/gemma-4-12B-it", 28, 40, 24),
-        new("gemma-4-26b-a4b-it", "Gemma 4 26B A4B", "google/gemma-4-26B-A4B-it", 55, 72, 48)
+        new("gemma-4-e2b-it", "E2B — Lightweight", "google/gemma-4-E2B-it", 10.3, "2.3B Class", "Lightweight", "RAM: approximately 2 GB+", "Small PC / lightweight local AI"),
+        new("gemma-4-e4b-it", "E4B — Balanced", "google/gemma-4-E4B-it", 18, "4.5B Class", "Balanced", "RAM: approximately 3–6 GB+", "Laptop / general purpose"),
+        new("gemma-4-12b-it", "12B Unified — High Quality", "google/gemma-4-12B-it", 28, "12B Class", "High Quality", "RAM: approximately 8–14 GB+", "Multimodal / high quality"),
+        new("gemma-4-26b-a4b-it", "26B MoE — Extreme", "google/gemma-4-26B-A4B-it", 55, "26B MoE Class", "Extreme", "VRAM: approximately 14–26 GB+", "High-end GPU / workstation")
     ];
     private readonly string _runtime;
     private readonly PersistentPythonWorker _engine;
@@ -2017,6 +2017,8 @@ public sealed class ModelManagerWindow : Window
     private readonly ProgressBar _progress = new() { Minimum = 0, Maximum = 100, Height = 18, Visibility = Visibility.Collapsed };
     private readonly Button _download = new() { Content = "Download model", Padding = new Thickness(12, 6, 12, 6) };
     private readonly Button _load = new() { Content = "Load model", Padding = new Thickness(12, 6, 12, 6), IsEnabled = false };
+    private readonly Button _diagnoseDownload = new() { Content = "PowerShell diagnostic", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(8, 0, 0, 0) };
+    private readonly Button _retryWithPowerShell = new() { Content = "PowerShell retry", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(8, 0, 0, 0) };
     private readonly ComboBox _gemmaModel = new() { Width = 220, Margin = new Thickness(8, 0, 0, 0) };
     private readonly TextBlock _gemmaDescription = new() { TextWrapping = TextWrapping.Wrap };
     private readonly CodexCliBackend _codex;
@@ -2025,6 +2027,11 @@ public sealed class ModelManagerWindow : Window
     private readonly ComboBox _codexBackend = new() { Width = 150, Margin = new Thickness(8, 0, 0, 0) };
     private readonly TextBlock _codexState = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
     private readonly TextBlock _claudeState = new() { TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 8, 0, 8) };
+    private readonly Button _cancelModelOperation = new() { Content = "Cancel", Padding = new Thickness(12, 6, 12, 6), Margin = new Thickness(8, 0, 0, 0), Visibility = Visibility.Collapsed };
+    private readonly CancellationTokenSource _lifetimeCancellation = new();
+    private CancellationTokenSource? _refreshCancellation;
+    private CancellationTokenSource? _modelOperationCancellation;
+    private bool _isClosed;
     private bool _initialRefreshStarted;
     public ModelManagerWindow(string appBase, PersistentPythonWorker engine, CodexCliBackend codex, CodexAppServerBackend appServer, ClaudeCodeCliBackend claude)
     {
@@ -2039,6 +2046,14 @@ public sealed class ModelManagerWindow : Window
             try { await RefreshAsync(); }
             catch (Exception error) { ShowRefreshFailure(error); }
             finally { Debug.WriteLine($"AltFactor model manager ready in {Stopwatch.GetElapsedTime(started).TotalMilliseconds:0} ms"); }
+        };
+        Closed += (_, _) =>
+        {
+            _isClosed = true;
+            CancelAndDispose(ref _refreshCancellation);
+            CancelAndDispose(ref _modelOperationCancellation);
+            _lifetimeCancellation.Cancel();
+            _lifetimeCancellation.Dispose();
         };
         panel.Children.Add(new TextBlock { Text = "音声認識", FontSize = 18 });
         panel.Children.Add(new TextBlock { Text = "OpenAI Whisper をベースにした音声認識\nBackend: faster-whisper\nモデル本体は、ここで明示的にダウンロードした場合だけ取得します。", TextWrapping = TextWrapping.Wrap });
@@ -2064,10 +2079,13 @@ public sealed class ModelManagerWindow : Window
         _gemmaModel.SelectionChanged += async (_, _) => { UpdateGemmaDescription(); await RefreshAsync(); };
         UpdateGemmaDescription();
         panel.Children.Add(_state); panel.Children.Add(_progress);
-        var actions = new StackPanel { Orientation = Orientation.Horizontal };
+        var actions = new WrapPanel { Orientation = Orientation.Horizontal };
         _download.Content = "モデルをダウンロード"; _load.Content = "モデルを読み込む";
         _download.Click += async (_, _) => await DownloadAsync(); actions.Children.Add(_download);
-        _load.Click += async (_, _) => await LoadAsync(); actions.Children.Add(_load); panel.Children.Add(actions);
+        _load.Click += async (_, _) => await LoadAsync(); actions.Children.Add(_load);
+        _diagnoseDownload.Click += (_, _) => LaunchPowerShellDiagnostic(download: false); actions.Children.Add(_diagnoseDownload);
+        _retryWithPowerShell.Click += (_, _) => LaunchPowerShellDiagnostic(download: true); actions.Children.Add(_retryWithPowerShell);
+        _cancelModelOperation.Click += (_, _) => _modelOperationCancellation?.Cancel(); actions.Children.Add(_cancelModelOperation); panel.Children.Add(actions);
         var refresh = new Button { Content = "確認 / 更新", Margin = new Thickness(0, 8, 0, 0), Padding = new Thickness(12, 6, 12, 6) }; refresh.Click += async (_, _) => await ValidateAsync(); panel.Children.Add(refresh);
         panel.Children.Add(new Separator { Margin = new Thickness(0, 16, 0, 8) });
         panel.Children.Add(new TextBlock { Text = "OpenAI Codex", FontSize = 18 });
@@ -2097,21 +2115,31 @@ public sealed class ModelManagerWindow : Window
         var chooseClaude = new Button { Content = "Claude CLIを参照...", Padding = new Thickness(12, 6, 12, 6) }; chooseClaude.Click += async (_, _) => await ChooseClaudeCliAsync();
         claudeActions.Children.Add(checkClaude); claudeActions.Children.Add(chooseClaude); panel.Children.Add(claudeActions);
     }
-    public async Task RefreshAsync()
+    public async Task RefreshAsync(bool includeOtherServices = true)
     {
-        await RefreshSpeechAsync();
+        CancelAndDispose(ref _refreshCancellation);
+        var refreshCancellation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        _refreshCancellation = refreshCancellation;
         try
         {
-            var response = await RunModelCommandAsync("model.status", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}");
+            if (includeOtherServices) await RefreshSpeechAsync();
+            var response = await RunModelCommandAsync("model.status", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}", cancellationToken: refreshCancellation.Token);
+            if (_isClosed || refreshCancellation.IsCancellationRequested) return;
             using var document = JsonDocument.Parse(response); var payload = document.RootElement.GetProperty("payload");
             var valid = payload.GetProperty("valid").GetBoolean(); var state = payload.GetProperty("state").GetString(); var path = payload.GetProperty("local_path").GetString();
             var compatibility = payload.GetProperty("compatibility"); var recommendation = compatibility.GetProperty("recommendation").GetString(); var reason = compatibility.GetProperty("reason").GetString();
             _state.Text = valid ? $"状態: {state}\n保存先: {path}\nこのPC: {recommendation} ({reason})\nPython Engine: 接続済み" : $"状態: {state}\nモデルは未導入または不完全です。\nこのPC: {recommendation} ({reason})\n保存先: {path}\nPython Engine: 接続済み";
             _download.IsEnabled = !valid; _load.IsEnabled = valid;
         }
-        catch (Exception error) { ShowRefreshFailure(error); }
-        await RefreshCodexAsync();
-        await RefreshClaudeAsync();
+        catch (OperationCanceledException) when (refreshCancellation.IsCancellationRequested) { }
+        catch (Exception error) { if (!_isClosed) ShowRefreshFailure(error); }
+        if (includeOtherServices && !refreshCancellation.IsCancellationRequested && !_isClosed)
+        {
+            await RefreshCodexAsync();
+            await RefreshClaudeAsync();
+        }
+        if (ReferenceEquals(_refreshCancellation, refreshCancellation)) _refreshCancellation = null;
+        refreshCancellation.Dispose();
     }
     public void ShowRefreshFailure(Exception error)
     {
@@ -2193,7 +2221,11 @@ public sealed class ModelManagerWindow : Window
         var item = SelectedSpeech;
         _speechDescription.Text = $"提供元: {item.Source}\n用途: {item.Notes}\n保存先: runtime\\models\\{item.Id}";
     }
-    private void UpdateGemmaDescription() { var item = SelectedGemma; _gemmaDescription.Text = $"提供元: Google / Instruction Tuned\nモデルID: {item.Source}\n概算サイズ: {item.DiskGb:0.#} GB\n推奨RAM: {item.RamGb} GB / 推奨VRAM: {item.VramGb} GB\n利用条件: https://huggingface.co/{item.Source}"; }
+    private void UpdateGemmaDescription()
+    {
+        var item = SelectedGemma;
+        _gemmaDescription.Text = $"{item.ModelClass} — {item.Tier}\n{item.MemoryGuide}\n{item.HardwareGuide}\n提供元: Google / Instruction Tuned\nモデルID: {item.Source}\n概算ダウンロード: {item.DiskGb:0.#} GB\n利用条件: https://huggingface.co/{item.Source}\nメモリ値は量子化・バックエンドで変わる目安です。非推奨環境でも警告後に続行できます。";
+    }
     private async Task RefreshSpeechAsync()
     {
         if (!HasSpeechModelRuntime())
@@ -2328,11 +2360,11 @@ public sealed class ModelManagerWindow : Window
         }
         return finalRoot;
     }
-    private async Task ValidateAsync() { _state.Text = "状態: 確認中..."; _state.Text = "確認結果: " + await RunModelCommandAsync("model.validate", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}"); await RefreshAsync(); }
-    private async Task LoadAsync() { _state.Text = "状態: モデルを読み込み中..."; _state.Text = "読み込み結果: " + await RunModelCommandAsync("model.load", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}"); await RefreshAsync(); }
-    private async Task<string> RunModelCommandAsync(string type, string payload, Action<string>? progress = null)
+    private async Task ValidateAsync() => await RunModelOperationAsync("Validating model...", "model.validate", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}");
+    private async Task LoadAsync() => await RunModelOperationAsync("Loading model...", "model.load", $"{{\"model_id\":\"{SelectedGemma.Id}\"}}");
+    private async Task<string> RunModelCommandAsync(string type, string payload, Action<string>? progress = null, CancellationToken cancellationToken = default)
     {
-        var response = await _engine.RequestAsync(_runtime, type, payload, progress);
+        var response = await _engine.RequestAsync(_runtime, type, payload, progress, cancellationToken);
         using var document = JsonDocument.Parse(response);
         var root = document.RootElement;
         if (root.TryGetProperty("type", out var responseType) && responseType.GetString() == "error")
@@ -2346,30 +2378,107 @@ public sealed class ModelManagerWindow : Window
         }
         return response;
     }
+    private void LaunchPowerShellDiagnostic(bool download)
+    {
+        var script = Path.Combine(_runtime, "python", "Test-AltFactorGemma.ps1");
+        if (!File.Exists(script))
+        {
+            MessageBox.Show(this, "Gemma PowerShell diagnostic is not installed. Reinstall the current AltFactor package.", Title, MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+        if (download)
+        {
+            var confirmation = MessageBox.Show(this,
+                $"PowerShell とポータブルPythonから {SelectedGemma.Name} の取得を再試行します。\n\n通常のGUIと同じ保存先を使用し、同じモデルの同時処理は拒否されます。続行しますか？",
+                Title, MessageBoxButton.OKCancel, MessageBoxImage.Warning);
+            if (confirmation != MessageBoxResult.OK) return;
+        }
+        var start = new ProcessStartInfo
+        {
+            FileName = "powershell.exe",
+            WorkingDirectory = Path.GetDirectoryName(script)!,
+            UseShellExecute = true,
+            WindowStyle = ProcessWindowStyle.Normal
+        };
+        start.ArgumentList.Add("-NoProfile");
+        start.ArgumentList.Add("-ExecutionPolicy");
+        start.ArgumentList.Add("Bypass");
+        start.ArgumentList.Add("-File");
+        start.ArgumentList.Add(script);
+        start.ArgumentList.Add("-ModelId");
+        start.ArgumentList.Add(SelectedGemma.Id);
+        if (download) start.ArgumentList.Add("-Download");
+        else start.ArgumentList.Add("-ProbeWeight");
+        try { Process.Start(start); }
+        catch (Exception error) { MessageBox.Show(this, "PowerShell diagnostic could not be started.\n" + error.Message, Title, MessageBoxButton.OK, MessageBoxImage.Error); }
+    }
     private async Task DownloadAsync()
     {
         var item = SelectedGemma;
         var confirmation = MessageBox.Show(this, $"{item.Name} をGoogle / Hugging Faceからダウンロードします。\n\nSource: {item.Source}\nDownload: approximately {item.DiskGb:0.#} GB\n保存先: runtime\\models\\{item.Id}\n\n利用条件を確認し、Hugging Faceで必要なアクセス承認を済ませてから続行してください。", Title, MessageBoxButton.OKCancel, MessageBoxImage.Warning);
         if (confirmation != MessageBoxResult.OK) return;
-        _download.IsEnabled = false; _progress.Visibility = Visibility.Visible; _state.Text = "Status: Downloading...";
+        var cancellation = BeginModelOperation();
+        _download.IsEnabled = false; _load.IsEnabled = false; _diagnoseDownload.IsEnabled = false; _retryWithPowerShell.IsEnabled = false; _cancelModelOperation.Visibility = Visibility.Visible; _progress.Visibility = Visibility.Visible; _progress.IsIndeterminate = true; _state.Text = "Status: Connecting...";
         try
         {
             await RunModelCommandAsync("model.download", $"{{\"model_id\":\"{item.Id}\",\"confirmed\":true}}", line =>
             {
                 using var json = JsonDocument.Parse(line); var root = json.RootElement;
-                if (root.TryGetProperty("payload", out var payload) && payload.TryGetProperty("percent", out var percent))
+                if (root.TryGetProperty("payload", out var payload))
                 {
-                    _progress.Value = percent.GetDouble();
+                    var phase = payload.TryGetProperty("phase", out var phaseElement) ? phaseElement.GetString() : "Downloading";
+                    var message = payload.TryGetProperty("message", out var messageElement) ? messageElement.GetString() : null;
+                    var percentValue = payload.TryGetProperty("percent", out var percent) ? percent.GetDouble() : 0;
+                    _progress.IsIndeterminate = phase is "Connecting" or "Authenticating" or "Metadata";
+                    _progress.Value = percentValue;
                     var downloaded = payload.TryGetProperty("downloaded_bytes", out var bytes) ? bytes.GetInt64() / 1_000_000_000d : 0;
                     var total = payload.TryGetProperty("total_bytes", out var totalBytes) ? totalBytes.GetInt64() / 1_000_000_000d : item.DiskGb;
-                    _state.Text = $"Status: Downloading {percent.GetDouble():0.0}%\n{downloaded:0.0} GB / {total:0.0} GB";
+                    _state.Text = $"Status: {phase} {percentValue:0.0}%\n{message}\n{downloaded:0.0} GB / {total:0.0} GB";
                 }
                 else if (root.TryGetProperty("error", out var error) && error.ValueKind != JsonValueKind.Null) throw new InvalidOperationException(error.ToString());
-            });
-            await RefreshAsync();
+            }, cancellation.Token);
         }
-        catch (Exception error) { _state.Text = "Status: Error\n" + error.Message; }
-        finally { _progress.Visibility = Visibility.Collapsed; _download.IsEnabled = true; }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { _state.Text = "Status: Download cancelled. You can retry safely."; }
+        catch (FatException error) { _state.Text = $"Status: Download failed ({error.Code}).\n{error.Message}\nPowerShell diagnostic can distinguish authentication, repository, network, and weight access."; Debug.WriteLine(error); }
+        catch (Exception error) { _state.Text = "Status: Download failed. Check your network, access permission, and free disk space.\n" + error.Message; Debug.WriteLine(error); }
+        finally { EndModelOperation(cancellation); _progress.IsIndeterminate = false; _progress.Visibility = Visibility.Collapsed; _download.IsEnabled = true; if (!_isClosed) await RefreshAsync(includeOtherServices: false); }
+    }
+    private async Task RunModelOperationAsync(string status, string command, string payload)
+    {
+        var cancellation = BeginModelOperation();
+        _state.Text = status; _download.IsEnabled = _load.IsEnabled = _diagnoseDownload.IsEnabled = _retryWithPowerShell.IsEnabled = false; _cancelModelOperation.Visibility = Visibility.Visible;
+        try
+        {
+            _state.Text = "Result: " + await RunModelCommandAsync(command, payload, cancellationToken: cancellation.Token);
+        }
+        catch (OperationCanceledException) when (cancellation.IsCancellationRequested) { _state.Text = "Operation cancelled. You can retry safely."; }
+        catch (FatException error) { _state.Text = $"Operation failed ({error.Code}).\n{error.Message}"; Debug.WriteLine(error); }
+        catch (Exception error) { _state.Text = "Operation failed. The application is still available.\n" + error.Message; Debug.WriteLine(error); }
+        finally { EndModelOperation(cancellation); if (!_isClosed) await RefreshAsync(includeOtherServices: false); }
+    }
+    private CancellationTokenSource BeginModelOperation()
+    {
+        CancelAndDispose(ref _modelOperationCancellation);
+        var operation = CancellationTokenSource.CreateLinkedTokenSource(_lifetimeCancellation.Token);
+        _modelOperationCancellation = operation;
+        return operation;
+    }
+    private void EndModelOperation(CancellationTokenSource operation)
+    {
+        if (ReferenceEquals(_modelOperationCancellation, operation)) _modelOperationCancellation = null;
+        operation.Dispose();
+        if (!_isClosed)
+        {
+            _cancelModelOperation.Visibility = Visibility.Collapsed;
+            _diagnoseDownload.IsEnabled = _retryWithPowerShell.IsEnabled = true;
+        }
+    }
+    private static void CancelAndDispose(ref CancellationTokenSource? source)
+    {
+        var current = Interlocked.Exchange(ref source, null);
+        if (current is null) return;
+        try { current.Cancel(); }
+        finally { current.Dispose(); }
     }
     private static string FindRuntime(string appBase)
     {
@@ -2389,6 +2498,7 @@ public sealed class ModelManagerWindow : Window
 
 public sealed class PersistentPythonWorker : IDisposable
 {
+    private const int MaximumStderrCharacters = 16 * 1024;
     private readonly SemaphoreSlim _gate = new(1, 1);
     private Process? _process;
     private StreamReader? _reader;
@@ -2422,7 +2532,7 @@ public sealed class PersistentPythonWorker : IDisposable
             }
             var error = _stderr is null ? "" : await _stderr;
             Reset();
-            throw new InvalidOperationException("FAT_PYTHON_DISCONNECTED: " + error);
+            throw new FatException("FAT_PYTHON_DISCONNECTED", "Python worker disconnected. " + SafeErrorDetail(error));
         }
         catch (OperationCanceledException)
         {
@@ -2462,7 +2572,13 @@ public sealed class PersistentPythonWorker : IDisposable
         start.Environment["PYTHONUTF8"] = "1";
         start.Environment["PYTHONIOENCODING"] = "utf-8";
         _process = Process.Start(start) ?? throw new FatException("FAT_PYTHON_START_FAILED", "Python FAT Engine could not be started.");
-        _writer = _process.StandardInput; _writer.AutoFlush = true; _reader = _process.StandardOutput; _stderr = _process.StandardError.ReadToEndAsync();
+        _writer = _process.StandardInput;
+        _writer.AutoFlush = true;
+        _reader = _process.StandardOutput;
+        // Python/native libraries can write repeated diagnostics to stderr.
+        // Drain it continuously to avoid pipe deadlocks, but retain only a
+        // bounded tail for a useful error message instead of growing memory.
+        _stderr = ReadBoundedAsync(_process.StandardError, MaximumStderrCharacters);
     }
 
     private static string FindEngine(string runtime)
@@ -2472,6 +2588,34 @@ public sealed class PersistentPythonWorker : IDisposable
         // packaged installation.  Do not accidentally select a user's legacy
         // sibling "python" folder, which may contain an older worker.
         return installed;
+    }
+
+    private static async Task<string> ReadBoundedAsync(StreamReader reader, int maximumCharacters)
+    {
+        var tail = new StringBuilder(maximumCharacters);
+        var buffer = new char[2048];
+        while (true)
+        {
+            var count = await reader.ReadAsync(buffer.AsMemory(0, buffer.Length));
+            if (count == 0) break;
+            if (count >= maximumCharacters)
+            {
+                tail.Clear();
+                tail.Append(buffer, count - maximumCharacters, maximumCharacters);
+                continue;
+            }
+            var overflow = tail.Length + count - maximumCharacters;
+            if (overflow > 0) tail.Remove(0, overflow);
+            tail.Append(buffer, 0, count);
+        }
+        return tail.ToString();
+    }
+
+    private static string SafeErrorDetail(string detail)
+    {
+        var normalized = detail.Trim();
+        if (string.IsNullOrWhiteSpace(normalized)) return "The worker ended without an error message.";
+        return normalized[..Math.Min(normalized.Length, MaximumStderrCharacters)];
     }
 
     private void Reset()

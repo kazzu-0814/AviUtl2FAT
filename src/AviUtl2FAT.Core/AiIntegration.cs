@@ -133,7 +133,7 @@ public sealed class CodexAppServerBackend(string? executablePath = null, TimeSpa
             start.ArgumentList.Add("app-server"); // official Codex App Server stdio transport
             _process = Process.Start(start) ?? throw new FatException("CODEX_APP_SERVER_START_FAILED", "Codex App Serverを開始できませんでした。");
             _writer = _process.StandardInput; _writer.AutoFlush = true; _reader = _process.StandardOutput; _stderr = _process.StandardError.ReadToEndAsync();
-            await RequestAsync("initialize", new { clientInfo = new { name = "aviutl2_altfactor", title = "AviUtl2 AltFactor", version = "2.0.2" } }, cancellationToken);
+            await RequestAsync("initialize", new { clientInfo = new { name = "aviutl2_altfactor", title = "AviUtl2 AltFactor", version = "2.0.3" } }, cancellationToken);
             await SendAsync(new { method = "initialized", @params = new { } }, cancellationToken);
             ConnectionState = CodexConnectionState.Connected;
         }

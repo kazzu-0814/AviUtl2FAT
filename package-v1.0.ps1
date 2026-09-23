@@ -10,7 +10,7 @@ param(
     [string]$TimestampUrl = 'http://timestamp.digicert.com',
     [string]$SignToolPath,
     [ValidatePattern('^\d+\.\d+\.\d+$')]
-    [string]$Version = '2.0.2'
+    [string]$Version = '2.0.3'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -139,7 +139,7 @@ if ($BuildPortablePython) {
 foreach ($document in @('README.md', 'QUICKSTART.md', 'LICENSE', 'THIRD_PARTY_NOTICES.txt', 'RELEASE_CHECKLIST.md', 'release\FFMPEG_PROVENANCE.md', 'release\licenses\GPL-3.0.txt')) {
     Copy-Item -LiteralPath (Join-Path $root $document) -Destination $dist -Force
 }
-$required = @('AviUtl2FAT.aux2', 'FAT\AviUtl2FAT.App.exe', 'FAT\AviUtl2FAT.App.dll', 'FAT\AviUtl2FAT.Core.dll', 'FAT\AviUtl2FAT.Worker.exe', 'FAT\AviUtl2FAT.Worker.dll', 'FAT\runtime\python\fat_worker.py', 'FAT\runtime\ffmpeg\ffmpeg.exe', 'FAT\runtime\ffmpeg\ffprobe.exe', 'FAT\licenses\GPL-3.0.txt', 'FAT\FFMPEG_PROVENANCE.md')
+$required = @('AviUtl2FAT.aux2', 'FAT\AviUtl2FAT.App.exe', 'FAT\AviUtl2FAT.App.dll', 'FAT\AviUtl2FAT.Core.dll', 'FAT\AviUtl2FAT.Worker.exe', 'FAT\AviUtl2FAT.Worker.dll', 'FAT\runtime\python\fat_worker.py', 'FAT\runtime\python\gemma_diagnostics.py', 'FAT\runtime\python\Test-AltFactorGemma.ps1', 'FAT\runtime\ffmpeg\ffmpeg.exe', 'FAT\runtime\ffmpeg\ffprobe.exe', 'FAT\licenses\GPL-3.0.txt', 'FAT\FFMPEG_PROVENANCE.md')
 if ($BuildPortablePython) { $required += 'FAT\runtime\python-runtime\python.exe' }
 foreach ($relative in $required) { if (-not (Test-Path -LiteralPath (Join-Path $payload $relative))) { throw "Package validation failed: $relative" } }
 

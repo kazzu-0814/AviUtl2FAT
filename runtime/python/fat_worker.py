@@ -97,6 +97,13 @@ def split_captions(message: dict[str, Any]) -> None:
     emit("result", message.get("id"), {"captions": [item.to_dict() for item in values]})
 
 
+def error_code(error: Exception) -> str:
+    """Preserve actionable MODEL_* failures without exposing a traceback."""
+    text = str(error)
+    prefix = text.split(":", 1)[0].strip()
+    return prefix if prefix.startswith("MODEL_") else "FAT_PYTHON_ERROR"
+
+
 def main() -> int:
     manager = ModelManager(Path.cwd() / "models")
     registry = ProviderRegistry(manager)
@@ -125,7 +132,7 @@ def main() -> int:
         except ModelDownloadError as error:
             emit("error", message.get("id") if "message" in locals() else None, error={"code": error.code, "message": str(error)})
         except Exception as error:
-            emit("error", message.get("id") if "message" in locals() else None, error={"code": "FAT_PYTHON_ERROR", "message": str(error)})
+            emit("error", message.get("id") if "message" in locals() else None, error={"code": error_code(error), "message": str(error)})
     return 0
 
 

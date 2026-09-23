@@ -1,6 +1,6 @@
 #define AppName "AviUtl2 AltFactor"
 #ifndef AppVersion
-  #define AppVersion "2.0.2"
+  #define AppVersion "2.0.3"
 #endif
 #define AppPublisher "AviUtl2 AltFactor Project"
 #ifndef SourcePayload

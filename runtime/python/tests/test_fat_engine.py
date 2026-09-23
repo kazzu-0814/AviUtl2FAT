@@ -1,5 +1,7 @@
 import unittest
 import tempfile
+import json
+import os
 from pathlib import Path
 import sys
 from types import SimpleNamespace
@@ -8,7 +10,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from fat_engine.models import Caption
-from fat_engine.model_manager import HuggingFaceModelDownloader, ModelDownloadError, ModelManager, ModelState, ModelRecommendation
+from fat_engine.model_manager import HuggingFaceModelDownloader, ModelDownloadError, ModelManager, ModelOperationLock, ModelState, ModelRecommendation
 from fat_engine.providers import FakeGemmaBackend, GemmaProvider, OutputValidator, PromptTemplates, ProviderRegistry
 
 
@@ -36,22 +38,36 @@ class FatEngineTests(unittest.TestCase):
             manager = ModelManager(Path(folder))
             self.assertTrue({"google/gemma-4-E2B-it", "google/gemma-4-E4B-it", "google/gemma-4-12B-it", "google/gemma-4-26B-A4B-it"}.issubset({item.source for item in manager.registry.all()}))
 
+    def test_download_progress_does_not_double_count_retry_incomplete_files(self):
+        with tempfile.TemporaryDirectory() as folder:
+            destination = Path(folder)
+            cache = destination / ".cache" / "huggingface" / "download"
+            cache.mkdir(parents=True)
+            (destination / "config.json").write_bytes(b"x" * 10)
+            (cache / "weight.hash.first.incomplete").write_bytes(b"x" * 100)
+            (cache / "weight.hash.second.incomplete").write_bytes(b"x" * 250)
+
+            self.assertEqual(HuggingFaceModelDownloader._downloaded_bytes(destination), 260)
+
     def test_gemma_download_uses_installed_huggingface_library_and_validates_files(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder)
             calls = []
-            def snapshot_download(*, repo_id, local_dir):
-                calls.append((repo_id, Path(local_dir)))
+            def snapshot_download(*, repo_id, local_dir, **options):
+                calls.append((repo_id, Path(local_dir), options.get("allow_patterns") is None))
                 local_dir = Path(local_dir)
                 local_dir.mkdir(parents=True, exist_ok=True)
                 for name in ("config.json", "processor_config.json", "tokenizer_config.json", "model.safetensors"):
                     (local_dir / name).write_text("{}", encoding="utf-8")
                 return str(local_dir)
-            manager = ModelManager(root, downloader=HuggingFaceModelDownloader(snapshot_download),
+            info = lambda *_args, **_kwargs: SimpleNamespace(siblings=[SimpleNamespace(size=10_300_000_000)])
+            manager = ModelManager(root, downloader=HuggingFaceModelDownloader(snapshot_download, info),
                                    device_status=lambda: {"cuda": False, "selected": "cpu", "ram_available_bytes": 100_000_000_000, "vram_bytes": None})
             with patch("fat_engine.model_manager.shutil.disk_usage", return_value=SimpleNamespace(free=100_000_000_000)):
                 result = manager.download("gemma-4-e2b-it", lambda _: None, lambda: False)
-            self.assertEqual([("google/gemma-4-E2B-it", root / "gemma-4-e2b-it")], calls)
+            self.assertEqual(2, len(calls))
+            self.assertEqual(("google/gemma-4-E2B-it", root / "gemma-4-e2b-it", False), calls[0])
+            self.assertEqual(("google/gemma-4-E2B-it", root / "gemma-4-e2b-it", True), calls[1])
             self.assertTrue(result["valid"])
             self.assertEqual(ModelState.INSTALLED, result["state"])
 
@@ -61,27 +77,44 @@ class FatEngineTests(unittest.TestCase):
             marker = partial / "partial-download.marker"; marker.write_text("keep", encoding="utf-8")
             class Denied(Exception):
                 response = SimpleNamespace(status_code=403)
-            manager = ModelManager(root, downloader=HuggingFaceModelDownloader(lambda **_: (_ for _ in ()).throw(Denied())),
+            manager = ModelManager(root, downloader=HuggingFaceModelDownloader(lambda **_: None, lambda *_args, **_kwargs: (_ for _ in ()).throw(Denied())),
                                    device_status=lambda: {"cuda": False, "selected": "cpu", "ram_available_bytes": 100_000_000_000, "vram_bytes": None})
             with patch("fat_engine.model_manager.shutil.disk_usage", return_value=SimpleNamespace(free=100_000_000_000)):
-                with self.assertRaisesRegex(ModelDownloadError, "Accept its Hugging Face terms"):
+                with self.assertRaisesRegex(ModelDownloadError, "account permissions"):
                     manager.download("gemma-4-e2b-it", lambda _: None, lambda: False)
             self.assertTrue(marker.is_file())
             self.assertEqual(ModelState.INCOMPLETE, manager.status("gemma-4-e2b-it")["state"])
+
+    def test_model_operation_lock_rejects_concurrent_same_model(self):
+        with tempfile.TemporaryDirectory() as folder:
+            with ModelOperationLock(Path(folder), "gemma-4-e2b-it"):
+                with self.assertRaisesRegex(ModelDownloadError, "already using this model") as raised:
+                    with ModelOperationLock(Path(folder), "gemma-4-e2b-it"):
+                        pass
+            self.assertEqual("MODEL_OPERATION_IN_PROGRESS", raised.exception.code)
+
+    def test_model_operation_lock_recovers_stale_owner(self):
+        with tempfile.TemporaryDirectory() as folder:
+            lock = Path(folder) / ".gemma-4-e2b-it.operation.lock"
+            lock.write_text(json.dumps({"pid": 2_147_483_647}), encoding="utf-8")
+            with ModelOperationLock(Path(folder), "gemma-4-e2b-it"):
+                self.assertEqual(os.getpid(), json.loads(lock.read_text(encoding="utf-8"))["pid"])
+            self.assertFalse(lock.exists())
 
     def test_local_registry_includes_opt_in_japanese_models(self):
         with tempfile.TemporaryDirectory() as folder:
             ids = {item.id for item in ModelManager(Path(folder)).registry.all()}
             self.assertTrue({"llm-jp-3-1.8b-instruct", "llm-jp-3-3.7b-instruct", "llama-3-elyza-jp-8b-gguf"}.issubset(ids))
 
-    def test_low_memory_rejects_large_model_load(self):
+    def test_low_memory_warns_but_does_not_block_explicit_large_model_load(self):
         with tempfile.TemporaryDirectory() as folder:
             root = Path(folder); model = root / "gemma-4-26b-a4b-it"; model.mkdir()
             for name in ("config.json", "processor_config.json", "tokenizer_config.json", "model.safetensors"): (model / name).write_text("{}", encoding="utf-8")
             manager = ModelManager(root, device_status=lambda: {"cuda": False, "selected": "cpu", "ram_available_bytes": 4_000_000_000, "vram_bytes": None})
             with patch("fat_engine.model_manager.shutil.disk_usage", return_value=SimpleNamespace(free=100_000_000_000)):
-                with self.assertRaisesRegex(RuntimeError, "MODEL_INSUFFICIENT_MEMORY"): manager.load_model("gemma-4-26b-a4b-it", lambda _: object())
+                loaded = manager.load_model("gemma-4-26b-a4b-it", lambda _: object())
                 compatibility = manager.compatibility("gemma-4-26b-a4b-it")
+            self.assertTrue(loaded["loaded"])
             self.assertEqual(ModelRecommendation.NOT_RECOMMENDED, compatibility["recommendation"])
             self.assertEqual("MEMORY_INSUFFICIENT", compatibility["reason"])
 
